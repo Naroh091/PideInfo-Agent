@@ -499,7 +499,7 @@ El artefacto queda en `dist/PideInfo Agent/` (o `dist/PideInfo Agent.app` en mac
 
 ## Actualización automática
 
-El módulo `updater/github_updater.py` comprueba las GitHub Releases del repositorio buscando tags con el prefijo `agent-v` (para distinguirlos de los releases del backend principal).
+El módulo `updater/github_updater.py` comprueba las GitHub Releases del repositorio buscando tags con el prefijo `v` (formato semver estándar: `v1.2.3`).
 
 ### Flujo de actualización
 
@@ -507,8 +507,8 @@ El módulo `updater/github_updater.py` comprueba las GitHub Releases del reposit
 Al arrancar en modo --tray:
   │
   ├─ check_for_update()
-  │    └─ GET https://api.github.com/repos/Naroh091/vigia/releases?per_page=20
-  │    └─ Filtra tags agent-v*, compara con __version__ usando packaging.version
+  │    └─ GET https://api.github.com/repos/Naroh091/PideInfo-Agent/releases?per_page=20
+  │    └─ Filtra tags v*, compara con __version__ usando packaging.version
   │    └─ Si hay versión mayor → guarda (version, download_url) en memoria
   │
   ├─ Si hay actualización:
@@ -534,14 +534,16 @@ Al hacer clic en "Actualizar a vX.Y.Z...":
 
 ## CI/CD
 
-El workflow `.github/workflows/build-agent.yml` se activa con tags `agent-v*` (o manualmente).
+Dos workflows cooperan para entregar releases:
+
+- **`.github/workflows/build.yml`** — se ejecuta en cada push y PR a `master` (CI), en tags `v*` (release), y manualmente. Construye los binarios para las tres plataformas.
+- **`.github/workflows/release-please.yml`** — se ejecuta en cada push a `master`. [release-please](https://github.com/googleapis/release-please) acumula los commits desde el último tag, decide el bump semver según [Conventional Commits](https://www.conventionalcommits.org/) y abre/actualiza una **PR de release** con `version.py` + `pyproject.toml` bumpeados y `CHANGELOG.md` regenerado.
 
 ### Matriz de build
 
 | Runner | Plataforma | Artefacto |
 |---|---|---|
-| `macos-14` | Apple Silicon | `PideInfo-Agent-macos-arm64.dmg` |
-| `macos-13` | Intel | `PideInfo-Agent-macos-x64.dmg` |
+| `macos-14` | Apple Silicon (Intel vía Rosetta 2) | `PideInfo-Agent-macos-arm64.dmg` |
 | `windows-latest` | x64 | `PideInfo-Agent-windows-x64-setup.exe` |
 | `ubuntu-22.04` | x64 | `PideInfo-Agent-linux-x64.AppImage` |
 
@@ -549,20 +551,31 @@ El workflow `.github/workflows/build-agent.yml` se activa con tags `agent-v*` (o
 
 1. Instala Python 3.11 y dependencias del proyecto
 2. Instala PyInstaller
-3. Ejecuta `pyinstaller build/pideinfo-agent.spec`
-4. **macOS**: crea DMG con `hdiutil`; firma con `codesign` si hay certificado disponible; notariza con `xcrun notarytool` si hay credenciales de Apple
-5. **Windows**: empaqueta con NSIS usando `installer.nsi`
-6. **Linux**: construye AppDir y empaqueta con `appimagetool`
-7. Sube el artefacto como GitHub Release asset
+3. **Bake Sentry config**: el step escribe `_baked_env.py` con `SENTRY_DSN_AGENT` (secreto de GitHub) y `SENTRY_ENVIRONMENT` (`production` para tags `v*`, `development` en CI / PR / `workflow_dispatch`).
+4. Ejecuta `pyinstaller build/pideinfo-agent.spec`
+5. **macOS**: crea DMG con `hdiutil`; firma con `codesign` si hay certificado disponible; notariza con `xcrun notarytool` si hay credenciales de Apple
+6. **Windows**: empaqueta con NSIS usando `installer.nsi`
+7. **Linux**: construye AppDir y empaqueta con `appimagetool`
+8. En tag `v*`: descarga los artefactos y los adjunta a la Release que creó release-please (`gh release upload --clobber`).
 
-### Crear un release
+### Cómo se publica una release
 
-```bash
-git tag agent-v1.0.0
-git push origin agent-v1.0.0
-```
+El versionado es **automático** según semver, derivado de los mensajes de commit (Conventional Commits):
 
-El CI construye los cuatro binarios y crea automáticamente la GitHub Release con todos los assets adjuntos.
+| Commit | Bump |
+|---|---|
+| `fix: ...` | patch (`0.1.0` → `0.1.1`) |
+| `feat: ...` | minor (`0.1.0` → `0.2.0`) |
+| `feat!: ...` o `BREAKING CHANGE:` en el cuerpo | major (`0.1.0` → `1.0.0`) |
+| `chore:`, `docs:`, `ci:`, `refactor:`, `test:` | sin bump |
+
+Flujo end-to-end:
+
+1. Mergeas commits en `master`.
+2. release-please abre/actualiza una PR titulada `chore(master): release X.Y.Z` con el bump y el changelog.
+3. Cuando quieras publicar, mergeas esa PR.
+4. release-please crea el tag `vX.Y.Z` y la GitHub Release (vacía).
+5. `build.yml` se dispara con el tag, construye los binarios y los adjunta a la Release.
 
 ---
 

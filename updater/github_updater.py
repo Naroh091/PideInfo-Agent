@@ -1,8 +1,8 @@
 """Auto-update checker and downloader for PideInfo Agent.
 
-Checks GitHub Releases for tags starting with 'agent-v' and compares against
-the running version. If a newer version is found, notifies the user via the
-tray menu and offers a one-click download-and-install flow.
+Checks GitHub Releases for tags starting with 'v' and compares against the
+running version. If a newer version is found, notifies the user via the tray
+menu and offers a one-click download-and-install flow.
 """
 
 from __future__ import annotations
@@ -20,8 +20,8 @@ from version import __version__
 
 console = Console()
 
-_RELEASES_URL = "https://api.github.com/repos/Naroh091/pideinfo/releases"
-_TAG_PREFIX = "agent-v"
+_RELEASES_URL = "https://api.github.com/repos/Naroh091/PideInfo-Agent/releases"
+_TAG_PREFIX = "v"
 
 # Platform → expected asset name suffix
 _ASSET_SUFFIXES: dict[str, str] = {
