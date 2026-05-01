@@ -31,6 +31,7 @@ async def authenticate(
     timeout_seconds: int = 120,
     target_path: str = "/privada/expedientes",
     firefox_profile_dir: Path | None = None,
+    firefox_profile_master: Path | None = None,
     force_headed: bool = False,
 ) -> dict[str, str]:
     """
@@ -52,6 +53,12 @@ async def authenticate(
     # from Firefox's native cert picker.  Once the persistent profile has been
     # initialised (prefs.js exists) the choice is remembered and we can run
     # headless — no UI required.
+    #
+    # If a master profile already exists (trained by another portal), seed it
+    # into this profile so the user doesn't re-pick the cert per portal.
+    if firefox_profile_dir is not None:
+        from auth.profile_seed import seed_from_master
+        seed_from_master(firefox_profile_dir, firefox_profile_master)
     profile_ready = (
         firefox_profile_dir is not None
         and (firefox_profile_dir / "prefs.js").exists()
@@ -148,6 +155,10 @@ async def authenticate(
             cookies = await context.cookies(portal_url)
             if firefox_profile_dir is not None:
                 (firefox_profile_dir / ".pideinfo-cert-ready").touch()
+                # Promote to master if one isn't trained yet — bootstraps the
+                # seed source for all other portals.
+                from auth.profile_seed import promote_to_master
+                promote_to_master(firefox_profile_dir, firefox_profile_master)
             return _cookies_to_dict(cookies)
 
         except Exception as e:

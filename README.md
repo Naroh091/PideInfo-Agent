@@ -1,8 +1,18 @@
+
+
+![PideInfo Agent](docs/header.png)
+
 # PideInfo Agent
 
-Aplicación de escritorio que sincroniza automáticamente el **Portal de Transparencia de la AGE**, la **sede electrónica del Consejo de Transparencia y Buen Gobierno (CTBG)** y **DEHú / RedSARA** con el backend de PideInfo.
+Aplicación de escritorio que actúa como puente entre PideInfo y los portales de la administración española:
 
-El agente se ejecuta en segundo plano como icono en la barra del sistema (macOS), en la bandeja del sistema (Windows) o como AppIndicator (Linux). Autentica al usuario mediante el sistema Cl@ve, descarga documentos de las solicitudes de acceso a información y los envía a PideInfo vía webhook.
+- **Sincroniza** automáticamente el Portal de Transparencia (AGE), la sede electrónica del Consejo de Transparencia y Buen Gobierno (CTBG) y el buzón DEHú con el backend de PideInfo.
+- **Presenta reclamaciones** ante el CTBG por orden del usuario: la web manda una tarea al agente vía `pideinfo://`, el agente conduce el wizard Wicket de la sede CTBG con Cl@ve y devuelve el acuse a PideInfo.
+- **Registra documentación adicional** en RED SARA / Registro Electrónico General cuando el usuario lo solicita desde la web.
+
+DEHú y RED SARA / Registro Electrónico General son **plataformas distintas** (aunque ambas se sirvan desde dominios `*.redsara.es`): DEHú es el buzón único de notificaciones electrónicas, mientras que RED SARA / Registro Electrónico General es el registro telemático para presentar escritos ante cualquier administración.
+
+El agente se ejecuta en segundo plano como icono en la barra del sistema (macOS), en la bandeja del sistema (Windows) o como AppIndicator (Linux). Autentica al usuario mediante el sistema Cl@ve, mantiene sesiones por portal y se comunica con PideInfo vía HTTP+JWT.
 
 ---
 
@@ -27,36 +37,39 @@ El agente se ejecuta en segundo plano como icono en la barra del sistema (macOS)
 ## Arquitectura general
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                         PideInfo Agent                          │
-│                                                                 │
-│  ┌──────────┐    ┌──────────────┐    ┌────────────────────────┐ │
-│  │  Tray UI │    │  main.py     │    │  APScheduler           │ │
-│  │ (pystray)│───▶│  CLI entry   │───▶│  (daemon / cada 30 min)│ │
-│  └──────────┘    └──────┬───────┘    └───────────┬────────────┘ │
-│                         │                        │              │
-│              ┌──────────▼────────────────────────▼───────────┐  │
-│              │              do_sync()                         │  │
-│              └──────┬────────────────────────────────────────┘  │
-│                     │                                           │
-│          ┌──────────▼────────────────────────────────┐          │
-│          │           Portales (scrapers)              │          │
-│          │  ┌──────────────────┐  ┌────────────────┐  ┌───────────────┐ │ │
-│          │  │TransparenciaAGE  │  │ ConsejoScraper │  │  DehuScraper  │ │ │
-│          │  │  (httpx + regex) │  │ (BS4 + httpx)  │  │ (httpx + JWT) │ │ │
-│          │  └────────┬─────────┘  └───────┬────────┘  └──────┬────────┘ │ │
-│          └───────────┼────────────────────┼──────────────────┼──────────┘ │
-│                      │                    │                   │            │
-│          ┌───────────▼────────────────────▼───────────────────▼──────────┐│
-│          │                  PideInfoClient (JWT + httpx)                  ││
-│          │                   POST /api/agent/webhook                      ││
-│          └────────────────────────────────────────────────────────────────┘│
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                              PideInfo Agent                                  │
+│                                                                              │
+│  ┌──────────┐  ┌──────────────┐  ┌──────────┐  ┌────────────────────────┐    │
+│  │ Tray UI  │  │   main.py    │  │ protocol/│  │     APScheduler        │    │
+│  │(pystray) │─▶│  CLI entry   │◀─│ pideinfo:│  │ (sync cada 30 min,     │    │
+│  └──────────┘  └──────┬───────┘  │  ://     │  │  drain tareas cada 60s)│    │
+│                       │          └──────────┘  └────────────┬───────────┘    │
+│                       │                                     │                │
+│           ┌───────────▼─────────────┐  ┌────────────────────▼────────────┐   │
+│           │       do_sync()         │  │      tasks/ (dispatcher)        │   │
+│           │  scrapers por portal    │  │  present_complaint, …           │   │
+│           └────┬────────────────────┘  └────────────────┬────────────────┘   │
+│                │                                        │                    │
+│   ┌────────────▼───────────────┐  ┌────────────────────▼─────────────────┐   │
+│   │       Portales              │  │ portals/ctbg_complaint_filler        │   │
+│   │  TransparenciaAGE  CTBG     │  │ + auth/playwright_auth (Cl@ve)       │   │
+│   │  DehuScraper    RedSARA-REG │  │   conduce el wizard Wicket de        │   │
+│   │  Consejo expedientes        │  │   reclamaciones del CTBG             │   │
+│   └────────────┬────────────────┘  └────────────────┬─────────────────────┘   │
+│                │                                    │                         │
+│   ┌────────────▼────────────────────────────────────▼─────────────────────┐   │
+│   │                  PideInfoClient (httpx + JWT Bearer)                  │   │
+│   │   POST /api/agent/webhook   ·   /api/agent/tasks/{id}/{progress,…}    │   │
+│   └───────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│   observability.py  →  agent.log (rotativo)   +   Sentry (DSN baked-in)     │
 └──────────────────────────────────────────────────────────────────────────────┘
-         │                    │                      │
-         ▼                    ▼                      ▼
-Portal Transparencia    CTBG sede           DEHú / RedSARA
- AGE transparencia   consejodetrans-       dehu.redsara.es
- .sede.gob.es        parencia.gob.es       (REST API + JWT)
+       │                  │                  │                 │
+       ▼                  ▼                  ▼                 ▼
+ Portal Transparencia   CTBG sede           DEHú         RED SARA / Reg. Gral.
+   transparencia       consejodetrans-    dehu.redsara    reg.redsara.es
+   .sede.gob.es        parencia.gob.es      .es
 ```
 
 El agente es **sin servidor**: no expone puertos, no tiene base de datos propia. Todo el estado persistente (cookies de sesión, documentos ya sincronizados, token JWT) se guarda localmente en `~/.pideinfo-agent/`.
@@ -66,54 +79,60 @@ El agente es **sin servidor**: no expone puertos, no tiene base de datos propia.
 ## Estructura del proyecto
 
 ```
-agent/
-├── main.py                  # Punto de entrada CLI y orquestación de sincronización
-├── tray.py                  # Interfaz de bandeja del sistema (pystray + Pillow)
-├── config.py                # Configuración (pydantic-settings, .env)
-├── version.py               # Versión única: __version__ = "0.0.1"
-├── runtime.py               # Helpers para entornos frozen (PyInstaller)
+.
+├── main.py                  # Entry CLI: arranca tray/daemon/sync único + IPC pideinfo://
+├── tray.py                  # Bandeja del sistema (pystray + Pillow)
+├── config.py                # Settings tipadas (pydantic-settings, .env)
+├── version.py               # Fuente única de versión: __version__
+├── runtime.py               # Frozen helpers + apply_baked_env() + ensure_firefox()
+├── observability.py         # Logging rotativo a fichero + Sentry (DSN baked-in)
 │
 ├── auth/
-│   ├── playwright_auth.py        # Auth Cl@ve vía Firefox (headless tras 1ª vez)
-│   ├── session_manager.py        # Gestión de cookies de sesión con OS keyring
-│   ├── dehu_auth.py              # Auth DEHú: igual que anterior + captura de JWT
-│   └── dehu_session_manager.py   # Cookies + JWT para DEHú (verificación de expiración)
+│   ├── playwright_auth.py        # Auth Cl@ve vía Firefox + perfil persistente
+│   ├── session_manager.py        # Cookies del Portal de Transparencia
+│   ├── dehu_auth.py              # Auth DEHú: Cl@ve + captura del Bearer JWT Angular
+│   ├── dehu_session_manager.py   # Cookies + JWT DEHú (verifica `exp` localmente)
+│   ├── redsara_auth.py           # Auth RED SARA / Registro Electrónico General vía Cl@ve
+│   └── redsara_session_manager.py
 │
 ├── portals/
 │   ├── base.py              # Protocolo PortalScraper
-│   ├── transparencia_age.py # Scraper del Portal de Transparencia AGE
-│   ├── consejo_ctbg.py      # Scraper de la sede del CTBG
-│   └── dehu_redsara.py      # Scraper DEHú (REST API JSON + Bearer JWT)
+│   ├── transparencia_age.py # Scraper Portal de Transparencia AGE
+│   ├── consejo_ctbg.py      # Listado de buzón electrónico del CTBG (Wicket)
+│   ├── consejo_expediente.py        # Detalle de expediente CTBG (BS4 + httpx)
+│   ├── ctbg_complaint_filler.py     # Conduce el wizard Wicket de reclamaciones
+│   ├── dehu_redsara.py      # Scraper DEHú (REST API JSON) — nota: el nombre del
+│   │                        # fichero es histórico; la plataforma es solo DEHú
+│   └── redsara_rec.py       # Cliente RED SARA / Registro Electrónico General
+│
+├── protocol/                # Recepción de URLs pideinfo:// del SO
+│   ├── single_instance.py        # AF_UNIX / named pipe — relay si ya hay un agente
+│   ├── url_handler.py            # Parser y router de pideinfo://action/<id>
+│   ├── registration.py           # Registra el handler en Linux/Win/macOS
+│   └── macos_url_events.py       # NSAppleEventManager para URLs en runtime
+│
+├── tasks/                   # Tareas que la web envía al agente
+│   ├── __init__.py               # Dispatcher por tipo + report_exception
+│   └── present_complaint.py      # Pipeline de reclamación CTBG end-to-end
 │
 ├── client/
-│   └── pideinfo.py          # Cliente HTTP para el webhook de PideInfo
+│   └── pideinfo.py          # Cliente httpx async/sync con JWT Bearer
 │
-├── models/
-│   ├── portal.py            # Expediente, Notificacion, DocumentoExpediente
-│   ├── consejo.py           # ConsejoNotificacion
-│   └── dehu.py              # DehuNotificacion
-│
-├── storage/
-│   ├── state.py             # Estado de sincronización (docs ya enviados)
-│   ├── preferences.py       # Preferencias del usuario (JWT, cert)
-│   └── downloads.py         # Gestión de archivos descargados temporalmente
-│
-├── notifier/
-│   └── desktop.py           # Notificaciones de escritorio del sistema
-│
-├── ui/
-│   └── connect_dialog.py    # Diálogos de conexión con PideInfo
-│
-├── updater/
-│   └── github_updater.py    # Comprobación y descarga de actualizaciones
+├── models/                  # DTOs de portal y de notificaciones
+├── storage/                 # state.json + preferences.json + downloads/
+├── notifier/desktop.py      # Notificaciones del SO
+├── ui/connect_dialog.py     # Diálogos Tk: conectar / configurar
+├── updater/github_updater.py # Comprobación de releases v* en GitHub
 │
 ├── build/
-│   ├── pideinfo-agent.spec  # Spec de PyInstaller (todas las plataformas)
-│   ├── hooks/               # PyInstaller hooks (playwright, truststore)
-│   ├── macos/               # entitlements.plist para firma de código
+│   ├── pideinfo-agent.spec  # Spec PyInstaller (multiplataforma)
+│   ├── hooks/               # Hooks playwright + truststore
+│   ├── macos/               # entitlements.plist (firma + notarización)
 │   ├── windows/             # installer.nsi (NSIS)
 │   └── linux/               # .desktop + AppRun para AppImage
 │
+├── _baked_env.py            # Generado por CI: SENTRY_DSN_AGENT, SENTRY_ENVIRONMENT
+│                            # (gitignored — ver `.github/workflows/build.yml`)
 ├── requirements.txt
 ├── pyproject.toml
 └── .env.example
@@ -128,16 +147,24 @@ agent/
 ```
 main.py
   │
+  ├─ apply_baked_env()               ← inyecta SENTRY_DSN_AGENT/SENTRY_ENVIRONMENT
+  │                                    desde _baked_env.py si CI lo generó
   ├─ setup_playwright_env()          ← fija PLAYWRIGHT_BROWSERS_PATH antes de
   │                                    importar playwright en ningún módulo
   ├─ Settings(_env_file=...)         ← carga .env + variables de entorno
-  ├─ ensure_firefox()                ← descarga Firefox si no está instalado
-  │                                    (solo ocurre la primera vez, ~80 MB)
+  ├─ observability.init(...)         ← logging rotativo a agent.log + Sentry
+  ├─ acquire_or_relay(args.url, …)   ← single-instance vía AF_UNIX / named pipe
+  │                                    (si hay otro agente vivo, le relaya el URL
+  │                                     pideinfo:// y termina; en macOS también
+  │                                     instala el handler kAEGetURL en runtime)
+  ├─ ensure_firefox()                ← descarga Firefox si falta (~80 MB, 1ª vez)
+  ├─ Despacha args.url + drena cola de tareas pendientes en /api/agent/tasks
   └─ modo de ejecución:
        --tray    → _run_tray()       ← abre icono en barra del sistema
        --daemon  → do_daemon()       ← sincronización periódica con APScheduler
        --once    → do_sync()         ← un solo ciclo de sincronización
        --auth-only → do_auth()       ← solo abre el navegador para autenticar
+       --url <pideinfo://…>          ← se relaya al agente vivo (no spawn extra)
 ```
 
 ### 2. Flujo de autenticación con el portal
@@ -204,17 +231,63 @@ do_sync()
   │    ├─ BeautifulSoup parsea ElectronicMailboxListPanel
   │    └─ Reporta pendientes a PideInfo vía webhook (source: consejo_ctbg)
   │
-  └─ 4. DEHú / RedSARA ─────────────────────────────────────────────────
-       ├─ DehuSessionManager comprueba expiración del JWT en local
-       │    (decodifica base64 el payload, lee claim exp — sin red)
-       │    ├─ JWT válido → reutiliza cookies + JWT del keyring
-       │    └─ JWT expirado/ausente → re-auth Firefox (headless si perfil ya existe)
-       │         └─ context.on("request") captura Bearer JWT del primer XHR Angular
-       ├─ GET /api/v1/notifications (httpx + Authorization: Bearer <jwt>)
-       └─ Reporta notificaciones pendientes a PideInfo (source: dehu_redsara)
+  ├─ 4. DEHú ────────────────────────────────────────────────────────────
+  │    ├─ DehuSessionManager comprueba expiración del JWT en local
+  │    │    (decodifica base64 el payload, lee claim exp — sin red)
+  │    │    ├─ JWT válido → reutiliza cookies + JWT del keyring
+  │    │    └─ JWT expirado/ausente → re-auth Firefox (headless si perfil ya existe)
+  │    │         └─ context.on("request") captura Bearer JWT del primer XHR Angular
+  │    ├─ GET /api/v1/notifications (httpx + Authorization: Bearer <jwt>)
+  │    └─ Reporta notificaciones pendientes a PideInfo (source: dehu_redsara)
+  │
+  └─ 5. RED SARA / Registro Electrónico General ─────────────────────────
+       ├─ Sesión independiente Cl@ve (cookies_redsara.json + keyring)
+       └─ Sólo se invoca bajo demanda desde una tarea pideinfo:// (no se
+          incluye en el ciclo periódico — el Registro no tiene buzón que
+          pollear, sólo se usa para presentar escritos)
 ```
 
-### 4. Deduplicación de documentos
+### 4. Recepción de tareas pideinfo://
+
+La web puede pedirle al agente que **ejecute** algo (presentar una reclamación, registrar documentación en el REC, …) abriendo un URL `pideinfo://<action>/<task_id>`. El SO lo enruta al agente, que lo despacha al handler correspondiente.
+
+```
+Usuario clica "Presentar reclamación" en pideinfo.es
+  │
+  ▼
+Navegador → pideinfo://present-complaint/<task_id>
+  │
+  ▼
+SO entrega el URL al .app/.exe registrado:
+  Linux   → xdg-mime → .desktop → pideinfo-agent --url …
+  Windows → HKCU\Software\Classes\pideinfo → "%1"
+  macOS   → Launch Services → CFBundleURLTypes → kAEGetURL
+  │
+  ▼
+protocol/single_instance.acquire_or_relay()
+  ├─ Si NO hay agente vivo  → se convierte en primario y dispatch local
+  └─ Si hay agente vivo     → relaya por AF_UNIX/named pipe; en macOS se
+                              entrega además vía NSAppleEventManager
+  │
+  ▼
+tasks/dispatch_action_id(action, task_id, client)
+  ├─ POST /api/agent/tasks/{id}/claim   ← reserva la tarea (idempotente)
+  ├─ Resuelve el handler por task["type"] (ej. "present_complaint")
+  ├─ El handler envía progress_task() periódicamente
+  └─ complete_task(success=True|False, error=…, result={…})
+       ├─ Excepciones → logger.exception() + observability.capture_exception()
+       └─ Tags: task_id, task_type, mode → enriquecen el evento Sentry
+```
+
+Tipos de tarea soportados (`tasks/__init__.py`):
+
+| `task["type"]` | Handler | Qué hace |
+|---|---|---|
+| `present_complaint` | `tasks/present_complaint.py` | Conduce el wizard Wicket de reclamaciones del CTBG (`portals/ctbg_complaint_filler.py`), sube los PDFs descargados de PideInfo (`/api/agent/documents/{id}/download`) y devuelve registro/CSV. |
+
+Las tareas que llegaron mientras el agente estaba apagado se **drenan al arrancar** (`GET /api/agent/tasks/pending`) y, mientras corre, un job de APScheduler las pollea cada 60 s desde el tray.
+
+### 5. Deduplicación de documentos
 
 El estado de sincronización se persiste en `~/.pideinfo-agent/sync_state.json`:
 
@@ -301,9 +374,17 @@ El perfil de Firefox se guarda en `~/.pideinfo-agent/firefox-profile/`. Contiene
 - No tiene acceso a información de otras solicitudes de otros usuarios (el token JWT acota el acceso al usuario autenticado).
 - Los documentos descargados se almacenan en `~/.pideinfo-agent/downloads/` y se borran inmediatamente después de enviarlos al webhook.
 
+### Observabilidad
+
+- **Local**: `agent.log` rotativo (5 MB × 3) en `DATA_DIR`, capturando todos los `getLogger(__name__)` del agente.
+- **Sentry**: si el build tiene `SENTRY_DSN_AGENT` baked-in, los crashes y `logger.exception(...)` viajan a Sentry. El SDK aplica `before_send` para borrar `Authorization: Bearer …` y JWTs en URLs antes de enviar. El usuario puede desactivar la telemetría desde el menú del tray.
+- **Pre-auth**: `observability.init()` se llama antes de `acquire_or_relay`, así los crashes de bootstrap (Firefox missing, registro de URL handler, single-instance) llegan a Sentry — la clase de error que históricamente se perdía porque nadie estaba mirando los logs.
+
 ---
 
 ## Autenticación con los portales
+
+![El ciudadano se identifica con su certificado y el agente puentea hacia los cuatro portales](docs/identification.png)
 
 ### Portal de Transparencia AGE
 
@@ -323,7 +404,9 @@ Las cookies tienen una vida útil de varias horas. El agente las reutiliza en la
 
 La sede del CTBG usa el mismo sistema Cl@ve pero con un flujo ligeramente diferente (framework Wicket). El agente mantiene una **segunda sesión independiente** con su propio fichero de cookies (`cookies_ctbg.json`), ya que las cookies del portal principal no son válidas aquí.
 
-### DEHú / RedSARA
+### DEHú
+
+DEHú (Dirección Electrónica Habilitada Única) es el buzón único de notificaciones electrónicas del Estado. Aunque se sirve desde `dehu.redsara.es` y comparte la infraestructura RED SARA con otros servicios, **es una plataforma distinta** del Registro Electrónico General: aquí sólo se reciben notificaciones, no se presentan escritos.
 
 DEHú expone una **REST API JSON** en lugar de páginas HTML. Pero añade un requisito: además de las cookies de sesión, cada petición a la API requiere un **Bearer JWT** de corta duración (~10 minutos) que emite la aplicación Angular en el frontend.
 
@@ -399,18 +482,29 @@ El agente usa **pystray** para el icono en la barra del sistema y **Pillow** par
 
 ```
 Sincronizar ahora
+Comprobar tareas pendientes              ← drena /api/agent/tasks bajo demanda
 Resetear
 ────────────────
 Aceptar notificaciones electrónicas  [✓/☐]
+Sincronizar Portal de Transparencia  [✓/☐]
+Sincronizar CTBG                     [✓/☐]
+Sincronizar DEHú                     [✓/☐]
+Sincronizar Red SARA REC             [✓/☐]   ← RED SARA / Registro Electrónico General
 ────────────────
-Certificado ✓  (o "Configurar certificado…")
+Configurar...                            ← URL de PideInfo (override del .env)
+Handler pideinfo:// registrado           ← o "Registrar handler de pideinfo://"
 Desconectar
 Conectado como usuario@ejemplo.com
 ────────────────
-Actualizar a v1.2.0...              ← solo si hay actualización disponible
-PideInfo Agent v0.0.1               ← versión actual (deshabilitado)
+Actualizar a v1.2.0...                   ← solo si hay actualización disponible
+────────────────
+Deshabilitar headless                [✓/☐] ← fuerza ventana de Firefox visible
+Enviar telemetría de errores         [✓/☐] ← opt-out de Sentry
+PideInfo Agent v0.1.0                    ← versión actual (deshabilitado)
 Cerrar
 ```
+
+La autenticación con PideInfo es por **JWT**, no por certificado: el menú "Conectar" abre un diálogo que recibe un token generado en pideinfo.es. El certificado de Cl@ve sólo se usa contra los portales (Firefox + Keychain del SO).
 
 ### Indicador de actividad
 
@@ -434,22 +528,30 @@ Todas las variables se leen de un fichero `.env` (por defecto `.env` en el direc
 |---|---|---|
 | `PORTAL_URL` | `https://transparencia.sede.gob.es` | URL del Portal de Transparencia AGE |
 | `PORTAL_CTBG` | `https://sede.consejodetransparencia.gob.es/info.0` | URL de la sede del CTBG |
-| `PORTAL_DEHU` | `https://dehu.redsara.es` | URL del portal DEHú / RedSARA |
+| `PORTAL_DEHU` | `https://dehu.redsara.es` | URL del buzón único de notificaciones DEHú |
+| `PORTAL_REDSARA` | `https://reg.redsara.es` | URL de RED SARA / Registro Electrónico General |
 | `PIDEINFO_BASE_URL` | `http://localhost:8000` | URL base del backend de PideInfo |
 | `AUTH_TIMEOUT_SECONDS` | `120` | Segundos de espera para que el usuario complete la auth |
 | `SYNC_INTERVAL_MINUTES` | `30` | Intervalo entre sincronizaciones en modo daemon |
 | `DATA_DIR` | `~/.pideinfo-agent` | Directorio de datos del agente |
+| `HEADLESS_DISABLED` | `false` | Fuerza Firefox en modo visible para todos los flujos (debug). El tray puede activarlo en runtime; el valor efectivo es la OR de las dos fuentes. |
+| `CTBG_FULL_CRAWL` | `false` | Si `true`, recorre todos los expedientes del CTBG aunque estén cerrados; por defecto se detiene en el primer batch totalmente cerrado. |
+| `SENTRY_DSN_AGENT` | *(vacío)* | DSN del proyecto Sentry **del agente** (distinto del de la web). Vacío = telemetría off. |
+| `SENTRY_ENVIRONMENT` | `production` | Tag `environment` en los eventos Sentry (`production` para releases, `development` en CI manual). |
+| `DEBUG` | `false` | Verbose logging del flujo del agente. |
 ### Datos persistentes en `DATA_DIR`
 
 | Fichero | Contenido |
 |---|---|
-| `preferences.json` | Token JWT, email y nombre del usuario |
-| `cookies.json` | Timestamp de las cookies del portal principal (valores en keyring) |
+| `preferences.json` | Email/nombre del usuario, toggles de sincronización por portal, `telemetry_enabled`, `headless_disabled`. El JWT vive en el OS keyring, no en este fichero. |
+| `cookies.json` | Timestamp de las cookies del Portal de Transparencia (valores en keyring) |
 | `cookies_ctbg.json` | Timestamp de las cookies del CTBG (valores en keyring) |
-| `cookies_dehu.json` | Timestamp de las cookies de DEHú (valores en keyring) |
+| `cookies_dehu.json` | Timestamp de las cookies + JWT de DEHú (valores en keyring) |
+| `cookies_redsara.json` | Timestamp de las cookies de RED SARA / Registro Electrónico General (valores en keyring) |
 | `sync_state.json` | IDs de documentos ya sincronizados, pendientes por portal |
 | `firefox-profile/` | Perfil persistente de Firefox: preferencias de certificado por origen |
 | `downloads/` | Directorio temporal para documentos en tránsito |
+| `agent.log` | Log rotativo (5 MB × 3 ficheros) — todos los `getLogger()` del agente |
 
 ---
 
@@ -584,8 +686,6 @@ Flujo end-to-end:
 **Python 3.11+** es obligatorio (el proyecto usa `match`, `tomllib` y otras características modernas).
 
 ```bash
-cd agent
-
 # Crear entorno virtual
 python3.11 -m venv .venv
 source .venv/bin/activate      # Windows: .venv\Scripts\activate
@@ -598,7 +698,8 @@ playwright install firefox
 
 # Copiar y ajustar configuración
 cp .env.example .env
-# Editar .env con la URL de tu instancia de PideInfo
+# Editar .env con la URL de tu instancia de PideInfo y, opcionalmente,
+# SENTRY_DSN_AGENT para que los crashes lleguen a Sentry también en dev.
 
 # Ejecutar una sincronización de prueba (sin enviar a PideInfo)
 python main.py --dry-run
@@ -622,4 +723,5 @@ python main.py --tray
 | `beautifulsoup4` | ≥4.12 | Parseo HTML del CTBG (Wicket) |
 | `rich` | ≥13.0 | Salida de consola con formato |
 | `packaging` | ≥24.0 | Comparación semver para el auto-updater |
-| `pyobjc-*` | ≥9.2 | Integración con macOS (solo en macOS) |
+| `pyobjc-*` | ≥9.2 | Integración con macOS (solo en macOS) — incluye `NSAppleEventManager` para URLs `pideinfo://` en runtime |
+| `sentry-sdk` | ≥2.0 | Telemetría de errores (DSN baked-in en el build) |

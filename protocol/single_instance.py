@@ -69,6 +69,12 @@ def _serve_posix(on_url: Callable[[str], None]) -> None:
     server.listen(8)
     logger.info("Listening for relayed URLs on %s", path)
 
+    def _handle_one(url: str) -> None:
+        try:
+            on_url(url)
+        except Exception as e:
+            logger.exception("URL handler raised: %s", e)
+
     def loop():
         while True:
             try:
@@ -78,10 +84,14 @@ def _serve_posix(on_url: Callable[[str], None]) -> None:
             with conn:
                 data = conn.recv(2048).decode("utf-8", errors="replace").strip()
                 if data:
-                    try:
-                        on_url(data)
-                    except Exception as e:
-                        logger.exception("URL handler raised: %s", e)
+                    # Hand the URL off to a worker thread so the accept loop
+                    # stays responsive and multiple incoming URLs can be
+                    # processed in parallel (per-portal locks serialise the
+                    # cases where they actually conflict).
+                    threading.Thread(
+                        target=_handle_one, args=(data,),
+                        daemon=True, name="pideinfo-url-worker",
+                    ).start()
 
     threading.Thread(target=loop, daemon=True, name="pideinfo-ipc").start()
 
@@ -107,6 +117,12 @@ def _serve_windows(on_url: Callable[[str], None]) -> None:
         logger.warning("pywin32 missing; URL relay disabled on Windows.")
         return
 
+    def _handle_one(url: str) -> None:
+        try:
+            on_url(url)
+        except Exception as e:
+            logger.exception("URL handler raised: %s", e)
+
     def loop():
         while True:
             handle = win32pipe.CreateNamedPipe(
@@ -120,10 +136,11 @@ def _serve_windows(on_url: Callable[[str], None]) -> None:
                 _, data = win32file.ReadFile(handle, 4096)
                 url = data.decode("utf-8", errors="replace").strip()
                 if url:
-                    try:
-                        on_url(url)
-                    except Exception as e:
-                        logger.exception("URL handler raised: %s", e)
+                    # Off to a worker thread so the pipe loop stays free.
+                    threading.Thread(
+                        target=_handle_one, args=(url,),
+                        daemon=True, name="pideinfo-url-worker",
+                    ).start()
             finally:
                 try:
                     win32file.CloseHandle(handle)

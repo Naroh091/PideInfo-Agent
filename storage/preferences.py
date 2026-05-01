@@ -5,7 +5,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-import keyring
+from storage import keyring_cache as keyring  # in-memory-cached wrapper
 
 # Set to True once the portal comparecencia endpoint has been identified
 # and implemented in the scraper. Until then the feature does not actually

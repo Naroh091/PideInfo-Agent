@@ -60,8 +60,10 @@ async def do_auth(settings: Settings) -> dict[str, str]:
         portal_url=settings.portal_url,
         cookies_file=settings.cookies_file,
         auth_timeout=settings.auth_timeout_seconds,
-        firefox_profile_dir=settings.firefox_profile_dir,
+        firefox_profile_dir=settings.firefox_profile_for("transparencia"),
+        firefox_profile_master=settings.firefox_profile_master,
         force_headed=_force_headed(settings),
+        portal_id="transparencia",
     )
     notify_auth_required()
     cookies = await session.get_valid_session()
@@ -78,8 +80,10 @@ async def do_sync(settings: Settings, dry_run: bool = False, prefs: "AgentPrefer
         portal_url=settings.portal_url,
         cookies_file=settings.cookies_file,
         auth_timeout=settings.auth_timeout_seconds,
-        firefox_profile_dir=settings.firefox_profile_dir,
+        firefox_profile_dir=settings.firefox_profile_for("transparencia"),
+        firefox_profile_master=settings.firefox_profile_master,
         force_headed=force_headed,
+        portal_id="transparencia",
     )
     downloads = DownloadManager(settings.downloads_dir)
     state = load_state(settings.state_file)
@@ -399,8 +403,10 @@ async def _sync_consejo(
         cookies_file=settings.cookies_ctbg_file,
         auth_timeout=settings.auth_timeout_seconds,
         private_path="/enotifications.9",
-        firefox_profile_dir=settings.firefox_profile_dir,
+        firefox_profile_dir=settings.firefox_profile_for("ctbg"),
+        firefox_profile_master=settings.firefox_profile_master,
         force_headed=force_headed,
+        portal_id="ctbg",
     )
 
     try:
@@ -492,7 +498,8 @@ async def _sync_consejo_expedientes(
     try:
         async with ConsejoExpedienteScraper(
             portal_url=ctbg_base,
-            firefox_profile_dir=settings.firefox_profile_dir,
+            firefox_profile_dir=settings.firefox_profile_for("ctbg"),
+            firefox_profile_master=settings.firefox_profile_master,
             force_headed=force_headed,
         ) as scraper:
             try:
@@ -576,7 +583,8 @@ async def _sync_dehu(
     dehu_session = DehuSessionManager(
         portal_url=settings.portal_dehu,
         cookies_file=settings.cookies_dehu_file,
-        firefox_profile_dir=settings.firefox_profile_dir,
+        firefox_profile_dir=settings.firefox_profile_for("dehu"),
+        firefox_profile_master=settings.firefox_profile_master,
         auth_timeout=settings.auth_timeout_seconds,
         headless=headless,
     )
@@ -658,7 +666,8 @@ async def _sync_redsara(
     redsara_session = RedSaraSessionManager(
         portal_url=settings.portal_redsara,
         cookies_file=settings.cookies_redsara_file,
-        firefox_profile_dir=settings.firefox_profile_dir,
+        firefox_profile_dir=settings.firefox_profile_for("redsara"),
+        firefox_profile_master=settings.firefox_profile_master,
         auth_timeout=settings.auth_timeout_seconds,
         headless=headless,
     )
@@ -1144,6 +1153,11 @@ def main() -> None:
     settings = Settings(_env_file=args.env_file)
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     os.chmod(settings.data_dir, 0o700)
+
+    # One-time migration: promote a pre-split single firefox-profile/ to
+    # master so users keep their cert pick after upgrade.
+    from auth.profile_seed import migrate_legacy_profile
+    migrate_legacy_profile(settings.firefox_profile_legacy, settings.firefox_profile_master)
 
     console.print("[bold]PideInfo Agent[/]")
     console.print(f"[dim]Portal: {settings.portal_url}[/]")

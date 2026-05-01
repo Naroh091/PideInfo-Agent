@@ -17,7 +17,7 @@ import json
 import time
 from pathlib import Path
 
-import keyring
+from storage import keyring_cache as keyring  # in-memory-cached wrapper
 from rich.console import Console
 
 from auth.session_manager import SessionManager
@@ -38,9 +38,11 @@ class DehuSessionManager:
         firefox_profile_dir: Path,
         auth_timeout: int = 120,
         headless: bool = True,
+        firefox_profile_master: "Path | None" = None,
     ) -> None:
         self.portal_url = portal_url
         self.firefox_profile_dir = firefox_profile_dir
+        self.firefox_profile_master = firefox_profile_master
         self.auth_timeout = auth_timeout
         self.headless = headless
         self._inner = SessionManager(
@@ -48,6 +50,7 @@ class DehuSessionManager:
             cookies_file=cookies_file,
             auth_timeout=auth_timeout,
             firefox_profile_dir=firefox_profile_dir,
+            firefox_profile_master=firefox_profile_master,
         )
 
     # ------------------------------------------------------------------
@@ -92,14 +95,14 @@ class DehuSessionManager:
 
     async def get_valid_session(self) -> None:
         """
-        Ensure both cookies and JWT are valid.
-
-        If the JWT is still valid we assume the cookies are too (they were
-        saved together during the same auth session and expire later).
-
-        If the JWT is missing or expired we trigger a full Playwright
-        re-authentication which captures fresh cookies and a new JWT.
+        Ensure both cookies and JWT are valid. Holds the DEHú portal lock
+        so a parallel sync/task touching the DEHú Firefox profile waits.
         """
+        from portal_locks import lock_for
+        async with lock_for("dehu"):
+            await self._get_valid_session_impl()
+
+    async def _get_valid_session_impl(self) -> None:
         if self.jwt_is_valid():
             self._inner.load_cookies()
             console.print("[green]DEHú: sesión JWT válida[/]")
@@ -112,6 +115,7 @@ class DehuSessionManager:
             firefox_profile_dir=self.firefox_profile_dir,
             timeout_seconds=self.auth_timeout,
             headless=self.headless,
+            firefox_profile_master=self.firefox_profile_master,
         )
         self._inner.save_cookies(cookies)
         if jwt:

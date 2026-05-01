@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 
 import httpx
-import keyring
+from storage import keyring_cache as keyring  # in-memory-cached wrapper
 from rich.console import Console
 
 from auth.playwright_auth import authenticate, AuthTimeoutError, AuthCancelledError, AuthFailedError
@@ -30,14 +30,18 @@ class SessionManager:
         auth_timeout: int = 120,
         private_path: str = "/privada/expedientes",
         firefox_profile_dir: "Path | None" = None,
+        firefox_profile_master: "Path | None" = None,
         force_headed: bool = False,
+        portal_id: str = "",
     ):
         self.portal_url = portal_url
         self.cookies_file = cookies_file
         self.auth_timeout = auth_timeout
         self.private_path = private_path
         self.firefox_profile_dir = firefox_profile_dir
+        self.firefox_profile_master = firefox_profile_master
         self.force_headed = force_headed
+        self.portal_id = portal_id
         self._cookies: dict[str, str] = {}
 
     @property
@@ -132,7 +136,18 @@ class SessionManager:
         """
         Get valid session cookies. Tries saved cookies first,
         falls back to browser authentication.
+
+        Holds the per-portal lock for the entire flow so that concurrent
+        callers (sync + inbound `pideinfo://` task) don't fight over the
+        same Firefox profile directory.
         """
+        if not self.portal_id:
+            return await self._get_valid_session_impl()
+        from portal_locks import lock_for
+        async with lock_for(self.portal_id):
+            return await self._get_valid_session_impl()
+
+    async def _get_valid_session_impl(self) -> dict[str, str]:
         # Try saved cookies
         if self.load_cookies():
             console.print("[dim]Verificando sesión guardada...[/]")
@@ -147,6 +162,7 @@ class SessionManager:
             self.auth_timeout,
             target_path=self.private_path,
             firefox_profile_dir=self.firefox_profile_dir,
+            firefox_profile_master=self.firefox_profile_master,
             force_headed=self.force_headed,
         )
         self.save_cookies(cookies)

@@ -117,12 +117,17 @@ async def _drive_form(
     from playwright.async_api import async_playwright
     from config import Settings
     from portals.ctbg_complaint_filler import CtbgComplaintFiller, CtbgFillerError
+    from auth.profile_seed import seed_from_master, promote_to_master
+    from portal_locks import lock_for
 
     settings = Settings()
-    profile_dir = settings.firefox_profile_dir
-    profile_dir.mkdir(parents=True, exist_ok=True)
+    profile_dir = settings.firefox_profile_for("ctbg")
+    seed_from_master(profile_dir, settings.firefox_profile_master)
 
-    async with async_playwright() as p:
+    # Hold the CTBG portal lock for the entire Firefox session so concurrent
+    # CTBG sync (or another inbound CTBG task) waits instead of fighting over
+    # the profile lock. Other portals' work runs in parallel unaffected.
+    async with lock_for("ctbg"), async_playwright() as p:
         firefox_user_prefs = {
             "security.osclientcerts.autoload": True,
             "security.default_personal_cert": "Select Automatically",
@@ -239,6 +244,10 @@ async def _drive_form(
                     )
                 except Exception:
                     logger.exception("upload_filed_complaint_documents failed")
+
+        # If this run trained the CTBG profile (fresh install path) bootstrap
+        # the master so other portals can seed from it without re-prompting.
+        promote_to_master(profile_dir, settings.firefox_profile_master)
 
         return {
             "status": "registered" if registry_no else "awaiting_signature",

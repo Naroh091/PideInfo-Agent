@@ -82,6 +82,34 @@ class Settings(BaseSettings):
         return get_playwright_browsers_dir()
 
     @property
-    def firefox_profile_dir(self) -> Path:
-        """Persistent Firefox profile that remembers certificate selections."""
+    def firefox_profile_master(self) -> Path:
+        """Master persistent Firefox profile.
+
+        The first portal to authenticate trains this profile (headed window,
+        user picks the cert from Firefox's native picker). Per-portal
+        profiles are seeded from here so the user only picks the cert once.
+        """
+        return self.data_dir / "firefox-profile-master"
+
+    @property
+    def firefox_profile_legacy(self) -> Path:
+        """Pre-split single profile, kept for one-time migration."""
         return self.data_dir / "firefox-profile"
+
+    def firefox_profile_for(self, portal_id: str) -> Path:
+        """Per-portal Firefox profile dir.
+
+        Each portal gets its own profile so Playwright/Firefox can run
+        against multiple portals in parallel without fighting over the
+        single-instance profile lock.
+        """
+        return self.data_dir / f"firefox-profile-{portal_id}"
+
+    @property
+    def firefox_profile_dir(self) -> Path:
+        """Backward-compatible alias for the master profile.
+
+        Deprecated: callers should pick a portal-specific profile via
+        `firefox_profile_for(portal_id)`.
+        """
+        return self.firefox_profile_master

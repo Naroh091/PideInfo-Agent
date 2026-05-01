@@ -52,15 +52,26 @@ class ConsejoExpedienteScraper:
         portal_url: str,
         firefox_profile_dir: Path,
         force_headed: bool = False,
+        firefox_profile_master: "Path | None" = None,
     ):
         self.portal_url = portal_url.rstrip("/")
         self.firefox_profile_dir = firefox_profile_dir
+        self.firefox_profile_master = firefox_profile_master
         self.force_headed = force_headed
         self._pw: Optional[Playwright] = None
         self._context: Optional[BrowserContext] = None
         self._page: Optional[Page] = None
 
     async def __aenter__(self) -> "ConsejoExpedienteScraper":
+        from auth.profile_seed import seed_from_master
+        from portal_locks import lock_for
+        # Hold the CTBG portal lock for the lifetime of this scraper. Released
+        # in __aexit__ via the AsyncExitStack.
+        from contextlib import AsyncExitStack
+        self._stack = AsyncExitStack()
+        await self._stack.__aenter__()
+        await self._stack.enter_async_context(lock_for("ctbg"))
+        seed_from_master(self.firefox_profile_dir, self.firefox_profile_master)
         self._pw = await async_playwright().start()
         profile_ready = (self.firefox_profile_dir / "prefs.js").exists()
         cert_ready = (self.firefox_profile_dir / ".pideinfo-cert-ready").exists()
@@ -73,8 +84,6 @@ class ConsejoExpedienteScraper:
         }
         if headless or cert_ready:
             firefox_user_prefs["security.default_personal_cert"] = "Select Automatically"
-
-        self.firefox_profile_dir.mkdir(parents=True, exist_ok=True)
         self._context = await self._pw.firefox.launch_persistent_context(
             user_data_dir=str(self.firefox_profile_dir),
             headless=headless,
@@ -91,11 +100,16 @@ class ConsejoExpedienteScraper:
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
         try:
-            if self._context is not None:
-                await self._context.close()
+            try:
+                if self._context is not None:
+                    await self._context.close()
+            finally:
+                if self._pw is not None:
+                    await self._pw.stop()
         finally:
-            if self._pw is not None:
-                await self._pw.stop()
+            # Release the CTBG portal lock acquired in __aenter__.
+            if hasattr(self, "_stack") and self._stack is not None:
+                await self._stack.__aexit__(exc_type, exc, tb)
 
     # ------------------------------------------------------------------
     # Listing

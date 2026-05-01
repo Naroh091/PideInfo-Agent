@@ -22,6 +22,7 @@ async def authenticate_dehu(
     firefox_profile_dir: Path,
     timeout_seconds: int = 120,
     headless: bool = True,
+    firefox_profile_master: Path | None = None,
 ) -> tuple[dict[str, str], str]:
     """
     Authenticate to DEHú via Cl@ve and capture the short-lived Bearer JWT.
@@ -41,7 +42,8 @@ async def authenticate_dehu(
     # from Firefox's native cert picker.  Once the persistent profile has been
     # initialised (prefs.js exists) the choice is remembered and we can run
     # headless — no UI required.
-    firefox_profile_dir.mkdir(parents=True, exist_ok=True)
+    from auth.profile_seed import seed_from_master, promote_to_master
+    seed_from_master(firefox_profile_dir, firefox_profile_master)
     profile_ready = (firefox_profile_dir / "prefs.js").exists()
 
     if profile_ready:
@@ -114,6 +116,7 @@ async def authenticate_dehu(
             )
             console.print("[bold green]DEHú: autenticación completada[/]")
             (firefox_profile_dir / ".pideinfo-cert-ready").touch()
+            promote_to_master(firefox_profile_dir, firefox_profile_master)
 
             import asyncio
 
