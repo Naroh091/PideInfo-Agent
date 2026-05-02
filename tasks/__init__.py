@@ -81,5 +81,9 @@ def _report_exception(exc: BaseException, **tags: str) -> None:
 
 # Auto-register handlers
 from tasks.present_complaint import handle as _present_complaint_handle  # noqa: E402
+from tasks.submit_request_transparencia import handle as _submit_request_transparencia_handle  # noqa: E402
+from tasks.submit_request_reg import handle as _submit_request_reg_handle  # noqa: E402
 
 register("present_complaint", _present_complaint_handle)
+register("submit_request_transparencia", _submit_request_transparencia_handle)
+register("submit_request_reg", _submit_request_reg_handle)
