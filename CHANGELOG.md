@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/Naroh091/PideInfo-Agent/compare/v0.2.0...v0.3.0) (2026-05-02)
+
+
+### Features
+
+* implement sending access requests through the Portal de Transparencia ([48fbd8e](https://github.com/Naroh091/PideInfo-Agent/commit/48fbd8ec1892089d14f0f3f3def2391636f6acfa))
+
 ## [0.2.0](https://github.com/Naroh091/PideInfo-Agent/compare/v0.1.0...v0.2.0) (2026-05-01)
 
 
