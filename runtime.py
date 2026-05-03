@@ -67,12 +67,12 @@ def setup_playwright_env() -> None:
 
 
 def _firefox_is_installed() -> bool:
-    """Check whether Firefox has been fully downloaded to PLAYWRIGHT_BROWSERS_PATH.
+    """Check whether the exact Firefox version required by Playwright is present.
 
-    Verifies the executable exists, not just the wrapper directory — an
-    interrupted download leaves `firefox-XXXX/` empty, which would fool a
-    glob-only check and cause `launch_persistent_context` to fail with
-    "Executable doesn't exist".
+    Queries the Playwright driver for the expected browser build id, then
+    checks that the corresponding executable exists on disk.  A stale version
+    (e.g. firefox-1509 when 1511 is needed) is treated as *not installed* so
+    ``ensure_firefox`` will download the correct one.
     """
     browsers_path = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
     if not browsers_path:
@@ -80,19 +80,69 @@ def _firefox_is_installed() -> bool:
     base = Path(browsers_path)
     if not base.exists():
         return False
+
+    expected_dir = _expected_firefox_dir()
+    if expected_dir is not None:
+        ff_dir = base / expected_dir
+        return _firefox_executable_exists(ff_dir)
+
+    # Fallback: if we cannot determine the expected version, accept any.
     for ff_dir in base.glob("firefox-*"):
-        # Per-platform layout used by the Playwright bundle:
-        #   macOS:   firefox-XXXX/firefox/Nightly.app/Contents/MacOS/firefox
-        #   Linux:   firefox-XXXX/firefox/firefox
-        #   Windows: firefox-XXXX/firefox/firefox.exe
-        candidates = [
-            ff_dir / "firefox" / "Nightly.app" / "Contents" / "MacOS" / "firefox",
-            ff_dir / "firefox" / "firefox",
-            ff_dir / "firefox" / "firefox.exe",
-        ]
-        if any(c.exists() for c in candidates):
+        if _firefox_executable_exists(ff_dir):
             return True
     return False
+
+
+def _expected_firefox_dir() -> str | None:
+    """Return the directory name Playwright expects, e.g. ``firefox-1511``."""
+    try:
+        from playwright._impl._driver import compute_driver_executable, get_driver_env
+
+        node_path, cli_path = compute_driver_executable()
+        env = get_driver_env()
+        result = subprocess.run(
+            [node_path, cli_path, "install", "--dry-run", "firefox"],
+            capture_output=True, text=True, env=env, timeout=15,
+        )
+        output = result.stdout + result.stderr
+        m = re.search(r"(firefox-\d+)", output)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+
+    # Second attempt: read browsers.json from the Playwright driver package.
+    try:
+        from playwright._impl._driver import compute_driver_executable
+        _, cli_path = compute_driver_executable()
+        browsers_json = Path(cli_path).parent / "browsers.json"
+        if browsers_json.exists():
+            import json
+            for entry in json.loads(browsers_json.read_text()):
+                if entry.get("name") == "firefox":
+                    revision = entry.get("revision")
+                    if revision:
+                        return f"firefox-{revision}"
+    except Exception:
+        pass
+
+    return None
+
+
+def _firefox_executable_exists(ff_dir: Path) -> bool:
+    """Return True if the Firefox executable exists inside *ff_dir*."""
+    if not ff_dir.exists():
+        return False
+    # Per-platform layout used by the Playwright bundle:
+    #   macOS:   firefox-XXXX/firefox/Nightly.app/Contents/MacOS/firefox
+    #   Linux:   firefox-XXXX/firefox/firefox
+    #   Windows: firefox-XXXX/firefox/firefox.exe
+    candidates = [
+        ff_dir / "firefox" / "Nightly.app" / "Contents" / "MacOS" / "firefox",
+        ff_dir / "firefox" / "firefox",
+        ff_dir / "firefox" / "firefox.exe",
+    ]
+    return any(c.exists() for c in candidates)
 
 
 def ensure_firefox() -> None:
