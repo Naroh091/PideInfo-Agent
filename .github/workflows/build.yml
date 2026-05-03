@@ -13,6 +13,27 @@ on:
         description: 'Platforms to build (comma-separated: macos,windows,linux or "all")'
         required: false
         default: 'all'
+  workflow_call:
+    inputs:
+      tag_name:
+        description: 'Tag name for the release (e.g. v1.0.0)'
+        required: true
+        type: string
+    secrets:
+      SENTRY_DSN_AGENT:
+        required: false
+      MACOS_CERTIFICATE_P12_BASE64:
+        required: false
+      MACOS_CERTIFICATE_PASSWORD:
+        required: false
+      MACOS_SIGN_IDENTITY:
+        required: false
+      APPLE_ID:
+        required: false
+      APPLE_APP_SPECIFIC_PASSWORD:
+        required: false
+      APPLE_TEAM_ID:
+        required: false
 
 jobs:
   prepare:
@@ -85,10 +106,10 @@ jobs:
           SENTRY_DSN_AGENT: ${{ secrets.SENTRY_DSN_AGENT }}
         shell: bash
         run: |
-          # Tagged release builds (refs/tags/v*) report as "production"; CI / PR /
-          # workflow_dispatch builds report as "development" so we can filter them
-          # out in Sentry.
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+          # Tagged release builds or workflow_call releases report as "production";
+          # CI / PR / workflow_dispatch builds report as "development" so we can
+          # filter them out in Sentry.
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]] || [[ -n "${{ inputs.tag_name }}" ]]; then
             ENV_TAG="production"
           else
             ENV_TAG="development"
@@ -238,7 +259,7 @@ jobs:
   # ---------------------------------------------------------------------------
   release:
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.tag_name
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -256,8 +277,10 @@ jobs:
           echo "Collected assets:"
           ls -lh release-assets/
 
-      - name: Upload assets to release-please release
+      - name: Upload assets to GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          gh release upload "${{ github.ref_name }}" release-assets/* --clobber
+          TAG="${{ inputs.tag_name || github.ref_name }}"
+          gh release upload "$TAG" release-assets/* --clobber
