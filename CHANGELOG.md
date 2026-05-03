@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1](https://github.com/Naroh091/PideInfo-Agent/compare/v0.3.0...v0.3.1) (2026-05-03)
+
+
+### Bug Fixes
+
+* force release ([73c6f0b](https://github.com/Naroh091/PideInfo-Agent/commit/73c6f0b399b434167225da7607e92aa62717a437))
+
 ## [0.3.0](https://github.com/Naroh091/PideInfo-Agent/compare/v0.2.0...v0.3.0) (2026-05-02)
 
 
