@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.4.0](https://github.com/Naroh091/PideInfo-Agent/compare/v0.3.1...v0.4.0) (2026-05-04)
+
+
+### Features
+
+* add notifications when sending requests ([5c400b9](https://github.com/Naroh091/PideInfo-Agent/commit/5c400b9f6eabd16fea1b19a91cd31c1b6696e0a0))
+
+
+### Bug Fixes
+
+* CTBG filler ([9ea3688](https://github.com/Naroh091/PideInfo-Agent/commit/9ea3688d0216097e4701f947524cb9bf93d97639))
+* detect stale Firefox version and re-download on startup ([2b914ae](https://github.com/Naroh091/PideInfo-Agent/commit/2b914aeecf3deaf62ed6e678e66c48b0389c6626))
+
 ## [0.3.1](https://github.com/Naroh091/PideInfo-Agent/compare/v0.3.0...v0.3.1) (2026-05-03)
 
 
