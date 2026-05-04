@@ -54,5 +54,9 @@
       "Bash(find /Users/david/IdeaProjects/vigia/agent -name requirements*.txt -o -name *.spec -o -name build.yml -o -name *.yaml)",
       "Bash(find /Users/david/IdeaProjects/vigia -name *.yml -path */.github/*)"
     ]
-  }
+  },
+  "enabledMcpjsonServers": [
+    "metamcp"
+  ],
+  "enableAllProjectMcpServers": true
 }
