@@ -542,49 +542,61 @@ class PideInfoClient:
             console.print(f"[yellow]Saltado: {skipped['filename']} ({skipped['reason']})[/]")
         return result
 
-    async def sync_consejo_expediente_document(
+    async def sync_consejo_expediente_documents(
         self,
-        doc: DocumentoCTBGExpediente,
-        path: Path,
+        docs: list[tuple[DocumentoCTBGExpediente, Path]],
         expediente: ExpedienteCTBG,
     ) -> dict:
-        """Send a CTBG expediente document (any phase) to PideInfo.
+        """Send all new docs of one CTBG expediente in a single batch.
 
-        ``expedienteRef`` is the complaint number (e.g. ``"590/2026"``); the
-        backend's ``findByExternalId`` matches it against
-        ``AccessRequestComplaint.externalId``.
+        Atomicity matters: only the original solicitud (uploaded at filing
+        time via ``upload_filed_complaint_documents``) carries a
+        ``contentHash`` the backend can use to reconcile a freshly-opened
+        expediente with an existing ``AccessRequestComplaint``. Sending the
+        whole expediente as one request lets the backend defer non-matching
+        docs and replay them after the hash match promotes ``externalId`` —
+        avoiding a second crawl just to land the Consejo-generated phases
+        (acuse, oficios, resolución…).
 
-        ``metadata.complaint_phase`` lets the backend pre-assign a complaint
-        ``DocumentType`` deterministically so the doc lands in the
-        "Documentos de reclamación" section before the AI re-classifies it.
+        Per-doc fields (``complaint_phase``, ``csv``, ``documentTitle``)
+        travel in each document's ``metadata`` block; expediente-level fields
+        stay at the top level.
         """
-        suffix = path.suffix or ".pdf"
-        # Avoid path separators in titles (e.g. "Resolución expte. 501/2026").
-        safe_title = doc.title.replace("/", "-")
-        filename = f"{safe_title}{suffix}"
-        if not _is_valid_pdf(path):
-            _refuse_invalid_pdf([filename], source=f"CTBG expediente {expediente.numero}")
+        if not docs:
+            return {"created": [], "skipped": []}
 
-        content = path.read_bytes()
-        content_hash = hashlib.sha256(content).hexdigest()
-        content_b64 = base64.b64encode(content).decode("ascii")
+        invalid: list[str] = []
+        documents_payload: list[dict] = []
+        for doc, path in docs:
+            suffix = path.suffix or ".pdf"
+            # Avoid path separators in titles (e.g. "Resolución expte. 501/2026").
+            safe_title = doc.title.replace("/", "-")
+            filename = f"{safe_title}{suffix}"
+            if not _is_valid_pdf(path):
+                invalid.append(filename)
+                continue
+            content = path.read_bytes()
+            documents_payload.append({
+                "filename": filename,
+                "contentType": self._guess_mime(path),
+                "content": base64.b64encode(content).decode("ascii"),
+                "contentHash": hashlib.sha256(content).hexdigest(),
+                "portalDate": expediente.fecha_apertura,
+                "metadata": {
+                    "complaint_phase": doc.phase,
+                    "csv": doc.csv,
+                    "documentTitle": doc.title,
+                },
+            })
+
+        if invalid:
+            _refuse_invalid_pdf(invalid, source=f"CTBG expediente {expediente.numero}")
 
         payload = {
             "source": "consejo_ctbg",
-            "expedienteRef": doc.expediente_ref,
-            "documents": [
-                {
-                    "filename": filename,
-                    "contentType": self._guess_mime(path),
-                    "content": content_b64,
-                    "contentHash": content_hash,
-                    "portalDate": expediente.fecha_apertura,
-                }
-            ],
+            "expedienteRef": expediente.numero,
+            "documents": documents_payload,
             "metadata": {
-                "complaint_phase": doc.phase,
-                "csv": doc.csv,
-                "documentTitle": doc.title,
                 "expedienteEstado": expediente.estado,
                 "expedienteTitulo": expediente.titulo,
                 "fechaApertura": expediente.fecha_apertura,
@@ -592,7 +604,7 @@ class PideInfoClient:
             },
         }
 
-        async with httpx.AsyncClient(timeout=120) as client:
+        async with httpx.AsyncClient(timeout=300) as client:
             response = await client.post(
                 self._webhook_url,
                 json=payload,
@@ -604,11 +616,19 @@ class PideInfoClient:
             response.raise_for_status()
             result = response.json()
 
-        if result.get("created", 0) > 0:
-            console.print(f"[green]CTBG: {filename} → PideInfo[/]")
-        for skipped in result.get("skipped", []):
+        created = result.get("created")
+        if isinstance(created, list):
+            for item in created:
+                console.print(f"[green]CTBG: {item.get('filename', '?')} → PideInfo[/]")
+        elif isinstance(created, int) and created > 0:
             console.print(
-                f"[dim]CTBG saltado: {skipped['filename']} ({skipped['reason']})[/]"
+                f"[green]CTBG {expediente.numero}: {created} doc(s) → PideInfo[/]"
+            )
+        for s in result.get("skipped") or []:
+            retry_hint = " [reintentable]" if s.get("retryable") else ""
+            reason = s.get("reason") or s.get("code") or "?"
+            console.print(
+                f"[dim]CTBG saltado: {s.get('filename', '?')} ({reason}){retry_hint}[/]"
             )
         return result
 

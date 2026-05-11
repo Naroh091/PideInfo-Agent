@@ -485,6 +485,7 @@ async def _sync_consejo_expedientes(
     (``created``). Pre-existing duplicates rejected by hash dedup are not
     counted, matching the semantics of the AGE expediente sync.
     """
+    from models.consejo_expediente import DocumentoCTBGExpediente
     from portals.consejo_expediente import ConsejoExpedienteScraper
 
     ctbg_base = settings.portal_ctbg_base
@@ -545,20 +546,55 @@ async def _sync_consejo_expedientes(
                         )
                     continue
 
+                # Download all new docs of the expediente, then upload as one
+                # batch so the backend can promote ``externalId`` via hash on
+                # our solicitud and resolve the Consejo-generated phases in
+                # the same request (otherwise non-original docs land before
+                # the promotion and force a second crawl to retry them).
+                batch: list[tuple[DocumentoCTBGExpediente, Path]] = []
                 for d in new_docs:
                     safe_csv = d.csv or f"unknown-{abs(hash(d.title)) & 0xFFFFFF:06x}"
                     dest = downloads.downloads_dir / f"ctbg_{exp.numero.replace('/', '-')}_{safe_csv}.pdf"
                     try:
                         console.print(f"[dim]CTBG descargando [{d.phase}] {d.title}...[/]")
                         await scraper.download(d, dest)
-                        result = await pideinfo.sync_consejo_expediente_document(d, dest, exp)
-                        state.ctbg_synced_csvs.add(d.csv)
-                        synced += int(result.get("created", 0) or 0)
-                        downloads.cleanup_file(dest)
+                        batch.append((d, dest))
                     except Exception as e:
                         console.print(
                             f"[red]CTBG: error descargando {d.title}: {e}[/]"
                         )
+
+                if not batch:
+                    continue
+
+                try:
+                    result = await pideinfo.sync_consejo_expediente_documents(batch, exp)
+                    skipped_items = result.get("skipped") or []
+                    # Legacy backends won't echo per-doc ``csv``: degrade to
+                    # the old "persist everything" behavior so the new payload
+                    # shape doesn't regress until the backend ships per-doc
+                    # gating + hash reconciliation.
+                    has_per_doc_csv = any("csv" in s for s in skipped_items)
+                    retryable_csvs: set[str] = (
+                        {s["csv"] for s in skipped_items if s.get("retryable") and s.get("csv")}
+                        if has_per_doc_csv else set()
+                    )
+                    for d, _path in batch:
+                        if d.csv and d.csv not in retryable_csvs:
+                            state.ctbg_synced_csvs.add(d.csv)
+                    created = result.get("created")
+                    if isinstance(created, list):
+                        synced += len(created)
+                    elif isinstance(created, int):
+                        synced += created
+                except Exception as e:
+                    console.print(
+                        f"[red]CTBG: error subiendo lote de {exp.numero}: {e}[/]"
+                    )
+                finally:
+                    for _d, path in batch:
+                        downloads.cleanup_file(path)
+
                 # Persist after each expediente — survives a crash mid-crawl.
                 save_state(state, settings.state_file)
     except Exception as e:
