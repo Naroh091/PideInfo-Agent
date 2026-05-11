@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/Naroh091/PideInfo-Agent/compare/v0.4.0...v0.5.0) (2026-05-11)
+
+
+### Features
+
+* **ctbg:** derive complaint branch/reason from resolution_result ([212a30d](https://github.com/Naroh091/PideInfo-Agent/commit/212a30de1b6d2a4e24306b07e1059ba7830f2462))
+
 ## [0.4.0](https://github.com/Naroh091/PideInfo-Agent/compare/v0.3.1...v0.4.0) (2026-05-04)
 
 
