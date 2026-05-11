@@ -29,6 +29,22 @@ VALIDITY_SIMPLE_COPY = "EEG02"      # copia simple
 ORIGIN_BRING_MYSELF = "I_DECIDE_TO_BRING_IT_MYSELF"
 ORIGIN_PRESENTED_ELSEWHERE = "WAS_PRESENTED_IN_ANOTHER_ADMINISTRATION"
 
+# Map AccessRequest.resolutionResult → opción literal del desplegable
+# "RAZONES DE LA RECLAMACIÓN" del CTBG. Espejo de
+# `App\Controller\ComplaintController::mapStatusToCtbg()` en el backend.
+# El backend ya envía la cadena en `payload.complaint_reason`, pero
+# preferimos derivarla del valor tipado `payload.resolution_result` para que
+# la fuente de verdad sea una constante y no la cadena en español que el
+# portal podría retocar — `complaint_reason` se usa sólo como fallback para
+# tasks encolados antes de que el backend incluyera `resolution_result`.
+RESOLUTION_RESULT_TO_CTBG_REASON: dict[str, str] = {
+    "inadmitted":        "No se admitió a trámite la solicitud formulada",
+    "denied":            "Se denegó el acceso a toda información solicitada",
+    "partially_granted": "Se denegó el acceso a parte de la información solicitada",
+    "granted":           "Estoy disconforme con la información recibida",
+    # `silence` / None se gestionan en la rama branch=no (sin razón explícita).
+}
+
 
 class CtbgFillerError(RuntimeError):
     """Raised when the filler cannot complete a step."""
@@ -38,8 +54,15 @@ class CtbgComplaintFiller:
     """Fill the CTBG complaint form for one task.
 
     `payload` keys (from `ComplaintController::presentViaAgent`):
-        public_body_name, complaint_branch ('yes'|'no'),
-        complaint_reason (4 literals or None), notification_date (dd/mm/yyyy or None),
+        public_body_name,
+        resolution_result ('granted'|'partially_granted'|'denied'|'inadmitted'
+            |'silence'|None — tipo de respuesta de la administración; fuente
+            canónica para elegir branch y razón en el CTBG),
+        complaint_branch ('yes'|'no' — pre-derivado por el backend; fallback
+            si no llega `resolution_result`),
+        complaint_reason (4 literales o None — pre-derivado por el backend;
+            fallback si no llega `resolution_result`),
+        notification_date (dd/mm/yyyy or None),
         complaint_body (full text), request_external_id
 
     `files`:
@@ -60,6 +83,35 @@ class CtbgComplaintFiller:
         self.payload = payload
         self.files = files
         self.download_dir = download_dir
+
+    def _resolve_branch(self) -> str:
+        """Branch del CTBG ('yes' = recibí respuesta, 'no' = silencio).
+
+        Preferimos el valor tipado `resolution_result`: cualquier resultado
+        explícito de la administración (granted/partially_granted/denied/
+        inadmitted) implica branch='yes'; `silence` o ausencia de resultado
+        implican branch='no'. Sólo recurrimos al `complaint_branch` que envía
+        el backend si el payload no incluye `resolution_result` (tasks
+        encolados antes de añadirlo).
+        """
+        result = self.payload.get("resolution_result")
+        if result is not None:
+            return "no" if result == "silence" else "yes"
+        return self.payload.get("complaint_branch") or "no"
+
+    def _resolve_reason(self) -> Optional[str]:
+        """Texto literal de la opción «RAZONES DE LA RECLAMACIÓN» del CTBG.
+
+        Derivamos del valor tipado `resolution_result` cuando lo tenemos
+        (fuente de verdad del tipo de respuesta administrativa); usamos
+        `complaint_reason` sólo como fallback. Devuelve None en silencio o
+        cuando no hay datos suficientes — el caller decide si eso es un
+        error según la rama.
+        """
+        result = self.payload.get("resolution_result")
+        if result is not None:
+            return RESOLUTION_RESULT_TO_CTBG_REASON.get(result)
+        return self.payload.get("complaint_reason")
 
     async def run(self) -> dict:
         await self._step1_identification()
@@ -100,8 +152,11 @@ class CtbgComplaintFiller:
             value=self.payload["request_external_id"] or "",
         )
 
-        # B. RESPUESTA A SU SOLICITUD
-        branch = self.payload["complaint_branch"]
+        # B. RESPUESTA A SU SOLICITUD — derivar branch y razón del valor tipado
+        # `resolution_result` (preferente), con fallback a los campos
+        # pre-derivados por el backend.
+        branch = self._resolve_branch()
+        reason = self._resolve_reason()
         b_option = (
             "Sí he recibido respuesta a la solicitud" if branch == "yes"
             else "No he recibido respuesta a la solicitud"
@@ -117,9 +172,14 @@ class CtbgComplaintFiller:
                 label_re=re.compile(r"Fecha de notificaci", re.I),
                 dmy=self.payload["notification_date"] or "",
             )
+            if not reason:
+                raise CtbgFillerError(
+                    "Falta la razón de la reclamación: ni `resolution_result` "
+                    "ni `complaint_reason` permiten derivarla."
+                )
             await self._wicket_select(
                 label_re=re.compile(r"RAZONES DE LA RECLAMACI", re.I),
-                option_text=self.payload["complaint_reason"] or "",
+                option_text=reason,
             )
 
         # Motivos (común a ambas ramas)
@@ -133,7 +193,7 @@ class CtbgComplaintFiller:
     async def _step3_documents(self) -> None:
         await self._wait_for_step("3")
 
-        branch = self.payload["complaint_branch"]
+        branch = self._resolve_branch()
         if branch == "yes":
             # Card 0: Resolución frente a la que se reclama
             await self._attach_required_doc(0, self.files["respuesta"])
