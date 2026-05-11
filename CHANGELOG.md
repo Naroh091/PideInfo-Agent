@@ -1,5 +1,32 @@
 # Changelog
 
+## [0.4.0](https://github.com/Naroh091/PideInfo-Agent/compare/v0.3.1...v0.4.0) (2026-05-04)
+
+
+### Features
+
+* add notifications when sending requests ([5c400b9](https://github.com/Naroh091/PideInfo-Agent/commit/5c400b9f6eabd16fea1b19a91cd31c1b6696e0a0))
+
+
+### Bug Fixes
+
+* CTBG filler ([9ea3688](https://github.com/Naroh091/PideInfo-Agent/commit/9ea3688d0216097e4701f947524cb9bf93d97639))
+* detect stale Firefox version and re-download on startup ([2b914ae](https://github.com/Naroh091/PideInfo-Agent/commit/2b914aeecf3deaf62ed6e678e66c48b0389c6626))
+
+## [0.3.1](https://github.com/Naroh091/PideInfo-Agent/compare/v0.3.0...v0.3.1) (2026-05-03)
+
+
+### Bug Fixes
+
+* force release ([73c6f0b](https://github.com/Naroh091/PideInfo-Agent/commit/73c6f0b399b434167225da7607e92aa62717a437))
+
+## [0.3.0](https://github.com/Naroh091/PideInfo-Agent/compare/v0.2.0...v0.3.0) (2026-05-02)
+
+
+### Features
+
+* implement sending access requests through the Portal de Transparencia ([48fbd8e](https://github.com/Naroh091/PideInfo-Agent/commit/48fbd8ec1892089d14f0f3f3def2391636f6acfa))
+
 ## [0.2.0](https://github.com/Naroh091/PideInfo-Agent/compare/v0.1.0...v0.2.0) (2026-05-01)
 
 

@@ -52,6 +52,29 @@ class AgentPreferences:
         return bool(self.jwt_token)
 
 
+def is_headless_disabled(settings, prefs: "AgentPreferences | None" = None) -> bool:
+    """Return True if the user (or the env) has asked browsers to run headed.
+
+    Checks all three sources in priority order:
+      - ``HEADLESS_DISABLED`` env var (debug override)
+      - ``settings.headless_disabled`` (config/.env)
+      - ``prefs.headless_disabled`` (tray toggle, persisted in preferences.json)
+
+    ``prefs`` is loaded from disk if not provided. Tasks generally don't have
+    a long-lived prefs object so the disk read keeps the call site simple.
+    """
+    if os.getenv("HEADLESS_DISABLED", "").lower() == "true":
+        return True
+    if getattr(settings, "headless_disabled", False):
+        return True
+    if prefs is None:
+        try:
+            prefs = load_preferences(settings.preferences_file)
+        except Exception:
+            return False
+    return bool(getattr(prefs, "headless_disabled", False))
+
+
 def load_preferences(path: Path) -> AgentPreferences:
     """Load preferences from disk, returning defaults if missing or corrupt."""
     if not path.exists():

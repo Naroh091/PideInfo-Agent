@@ -17,6 +17,50 @@ from models.redsara import RedSaraRegistro
 console = Console()
 
 
+_PDF_MAGIC = b"%PDF-"
+
+
+class InvalidPdfError(RuntimeError):
+    """Raised when a file claiming to be a PDF doesn't have a %PDF- header.
+
+    Propagated from the client's upload methods so the calling sync loop's
+    ``except Exception`` catches it without marking the document as synced —
+    the next cycle will re-download and retry."""
+
+
+def _is_valid_pdf(path: Path) -> bool:
+    """File at *path* starts with the %PDF- magic header.
+
+    Some portals (notably CTBG) occasionally serve an HTML error page or an
+    empty body when a document is unavailable, and the agent still saves it
+    with a .pdf suffix. Sending that to the webhook pollutes the user's
+    documents with garbage. Files with a non-.pdf suffix bypass the check.
+    """
+    if path.suffix.lower() != ".pdf":
+        return True
+    try:
+        with path.open("rb") as f:
+            return f.read(len(_PDF_MAGIC)) == _PDF_MAGIC
+    except OSError:
+        return False
+
+
+def _refuse_invalid_pdf(filenames: list[str], source: str) -> None:
+    """Emit a desktop notification and raise InvalidPdfError.
+
+    Logs to console too. The notifier import is local so a failure to load
+    pystray/Pillow on a slim install doesn't take down the upload path."""
+    label = ", ".join(filenames) if filenames else "documento desconocido"
+    msg = f"{source}: {label} no es un PDF válido — se reintentará"
+    console.print(f"[yellow]{msg}[/]")
+    try:
+        from notifier.desktop import notify_error
+        notify_error(msg)
+    except Exception:
+        pass
+    raise InvalidPdfError(msg)
+
+
 class PideInfoClient:
     """Client for posting synced documents to PideInfo via JWT-authenticated API."""
 
@@ -165,17 +209,25 @@ class PideInfoClient:
         ``mapCtbgPhaseToType`` routes them: ``recibo*`` → ``ComplaintReceipt``,
         the rest → ``Complaint``.
         """
+        invalid: list[str] = []
         documents_payload = []
         for title, path in files.items():
-            content = path.read_bytes()
             safe_title = title.replace("/", "-")
             suffix = path.suffix or ".pdf"
+            filename = f"{safe_title}{suffix}"
+            if not _is_valid_pdf(path):
+                invalid.append(filename)
+                continue
+            content = path.read_bytes()
             documents_payload.append({
-                "filename": f"{safe_title}{suffix}",
+                "filename": filename,
                 "contentType": self._guess_mime(path),
                 "content": base64.b64encode(content).decode("ascii"),
                 "contentHash": hashlib.sha256(content).hexdigest(),
             })
+
+        if invalid:
+            _refuse_invalid_pdf(invalid, source="CTBG reclamación")
 
         payload = {
             "source": "consejo_ctbg",
@@ -234,11 +286,13 @@ class PideInfoClient:
         Send a downloaded document from a notification to PideInfo.
         Returns the webhook response as a dict.
         """
+        filename = f"{notificacion.tipo} - {notificacion.identificador}{document_path.suffix}"
+        if not _is_valid_pdf(document_path):
+            _refuse_invalid_pdf([filename], source="Portal de Transparencia")
+
         content = document_path.read_bytes()
         content_hash = hashlib.sha256(content).hexdigest()
         content_b64 = base64.b64encode(content).decode("ascii")
-
-        filename = f"{notificacion.tipo} - {notificacion.identificador}{document_path.suffix}"
 
         accepted_entry = {
             "notificationId": notificacion.id,
@@ -327,15 +381,23 @@ class PideInfoClient:
             key=lambda dp: (0 if dp[0].nombre.startswith("SOLICITUD") else 1),
         )
 
+        invalid: list[str] = []
         documents_payload = []
         for documento, path in sorted_docs:
+            filename = f"{documento.nombre}{path.suffix}"
+            if not _is_valid_pdf(path):
+                invalid.append(filename)
+                continue
             content = path.read_bytes()
             documents_payload.append({
-                "filename": f"{documento.nombre}{path.suffix}",
+                "filename": filename,
                 "contentType": self._guess_mime(path),
                 "content": base64.b64encode(content).decode("ascii"),
                 "contentHash": hashlib.sha256(content).hexdigest(),
             })
+
+        if invalid:
+            _refuse_invalid_pdf(invalid, source=f"Portal de Transparencia ({expediente.identificador})")
 
         payload = {
             "source": source,
@@ -431,12 +493,14 @@ class PideInfoClient:
         document_path: Path,
     ) -> dict:
         """Send a downloaded CTBG notification document to PideInfo."""
+        suffix = document_path.suffix or ".pdf"
+        filename = f"{notif.tipo} - {notif.registro}{suffix}"
+        if not _is_valid_pdf(document_path):
+            _refuse_invalid_pdf([filename], source="CTBG notificación")
+
         content = document_path.read_bytes()
         content_hash = hashlib.sha256(content).hexdigest()
         content_b64 = base64.b64encode(content).decode("ascii")
-
-        suffix = document_path.suffix or ".pdf"
-        filename = f"{notif.tipo} - {notif.registro}{suffix}"
 
         payload = {
             "source": "consejo_ctbg",
@@ -494,14 +558,16 @@ class PideInfoClient:
         ``DocumentType`` deterministically so the doc lands in the
         "Documentos de reclamación" section before the AI re-classifies it.
         """
-        content = path.read_bytes()
-        content_hash = hashlib.sha256(content).hexdigest()
-        content_b64 = base64.b64encode(content).decode("ascii")
-
         suffix = path.suffix or ".pdf"
         # Avoid path separators in titles (e.g. "Resolución expte. 501/2026").
         safe_title = doc.title.replace("/", "-")
         filename = f"{safe_title}{suffix}"
+        if not _is_valid_pdf(path):
+            _refuse_invalid_pdf([filename], source=f"CTBG expediente {expediente.numero}")
+
+        content = path.read_bytes()
+        content_hash = hashlib.sha256(content).hexdigest()
+        content_b64 = base64.b64encode(content).decode("ascii")
 
         payload = {
             "source": "consejo_ctbg",
@@ -655,11 +721,13 @@ class PideInfoClient:
         The webhook payload includes registry metadata so the backend can
         create a new AccessRequest if none exists for this registryNumber.
         """
+        filename = f"Justificante - {registro.registry_number}.pdf"
+        if not _is_valid_pdf(document_path):
+            _refuse_invalid_pdf([filename], source=f"Red SARA {registro.registry_number}")
+
         content = document_path.read_bytes()
         content_hash = hashlib.sha256(content).hexdigest()
         content_b64 = base64.b64encode(content).decode("ascii")
-
-        filename = f"Justificante - {registro.registry_number}.pdf"
 
         payload = {
             "source": "redsara_rec",

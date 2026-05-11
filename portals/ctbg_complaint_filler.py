@@ -243,13 +243,16 @@ class CtbgComplaintFiller:
         await self._wait_for_step("6")
         body_text = await self.page.locator("body").inner_text()
 
-        registry_no = None
-        m = re.search(r"\b(\d{4}-E-RE-\d+)\b", body_text)
+        registry_re = re.compile(r"\b(\d{4}-E-RE-\d+)\b")
+        csv_re = re.compile(r"CSV:\s*([A-Z0-9]+)")
+
+        registry_no: Optional[str] = None
+        m = registry_re.search(body_text)
         if m:
             registry_no = m.group(1)
 
-        csv = None
-        m = re.search(r"CSV:\s*([A-Z0-9]+)", body_text)
+        csv: Optional[str] = None
+        m = csv_re.search(body_text)
         if m:
             csv = m.group(1)
 
@@ -271,6 +274,14 @@ class CtbgComplaintFiller:
                 dest = target_dir / f"{slug}.pdf"
                 await d.save_as(str(dest))
                 downloads[slug] = dest
+                # The acuse page may not render the registry number in HTML —
+                # CTBG bakes it into the PDF filename ("Instancia firmada-
+                # 2026-E-RE-2491.pdf"), so harvest it from there as a fallback.
+                if not registry_no:
+                    suggested = d.suggested_filename or ""
+                    fm = registry_re.search(suggested)
+                    if fm:
+                        registry_no = fm.group(1)
                 console.print(f"[green]CTBG: bajado {slug} → {dest}[/]")
             except PlaywrightTimeoutError as e:
                 raise CtbgFillerError(
@@ -318,16 +329,23 @@ class CtbgComplaintFiller:
             pass
 
     async def _open_wicket_field(self, label_re: re.Pattern[str]) -> None:
-        """Click the 'Escribir' / 'Seleccionar' anchor whose parent's label
+        """Click the 'Escribir' / 'Seleccionar' anchor whose surrounding label
         matches *label_re*.
 
         Each field on the Wicket form is structured as::
 
-            <p> {label text} <a class="inputTextDiv personalizedField">Escribir</a> </p>
+            <p>
+              "A. ENTIDAD RECLAMADA"   ← text node, not an element
+              <br>
+              <span class="outerForm table-form">
+                <a class="inputTextDiv personalizedField">Escribir</a>
+              </span>
+            </p>
 
-        so we read the anchor's *immediate parent* text and subtract the
-        anchor's own text — no `closest()` walking, which was matching wider
-        containers after Wicket replaced filled fields.
+        The label sits as a text node inside the `<p>` *grandparent* of the
+        anchor — `el.parentElement` is the wrapping `<span>`, whose innerText
+        is just "Escribir". We walk up a few levels and return the first
+        ancestor whose innerText (minus the link's own text) is non-empty.
 
         Retries up to 3 times because Wicket can finish rendering after our
         idle wait completes.
@@ -342,11 +360,17 @@ class CtbgComplaintFiller:
                 a = anchors.nth(i)
                 label = await a.evaluate(
                     """el => {
-                        const p = el.parentElement;
-                        if (!p) return '';
-                        const own = (p.innerText || '').replace(/\\s+/g, ' ').trim();
                         const link = (el.innerText || '').trim();
-                        return link ? own.replace(link, '').trim() : own;
+                        let cur = el.parentElement;
+                        for (let depth = 0; depth < 4 && cur; depth++) {
+                            const own = (cur.innerText || '').replace(/\\s+/g, ' ').trim();
+                            const stripped = link
+                                ? own.split(link).join(' ').replace(/\\s+/g, ' ').trim()
+                                : own;
+                            if (stripped.length > 0) return stripped;
+                            cur = cur.parentElement;
+                        }
+                        return '';
                     }"""
                 )
                 last_labels.append(label or "")

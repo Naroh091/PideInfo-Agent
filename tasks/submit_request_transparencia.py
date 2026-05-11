@@ -145,12 +145,21 @@ async def _drive(
         )
         page = context.pages[0] if context.pages else await context.new_page()
 
+        # Firefox doesn't persist session cookies (no Expires) across launches,
+        # so cookies.sqlite of a freshly-launched profile is empty for
+        # transparencia.sede.gob.es even though the keyring/httpx side may
+        # still have valid ones. /procedimiento/formulario does NOT redirect
+        # to Cl@ve when unauthenticated — it just 401s. Force a silent Cl@ve
+        # round-trip first to refresh Firefox's in-memory session cookies.
+        client.progress_task(task_id, status="in_progress", note="Refrescando sesión Cl@ve")
+        await _warm_up_clave_session(page, portal_url, console)
+
         client.progress_task(task_id, status="in_progress", note="Abriendo wizard PT")
         await page.goto(wizard_url, wait_until="domcontentloaded")
         if "/error/401" in page.url:
             from auth.session_manager import SessionExpiredError
             raise SessionExpiredError(
-                f"transparencia: 401 al abrir el wizard ({page.url}); el portal no redirige a Cl@ve desde /procedimiento/formulario."
+                f"transparencia: 401 al abrir el wizard tras warm-up ({page.url})."
             )
 
         # Wait for the dnt-* runtime to load and at least one dnt-input to render.
@@ -178,7 +187,18 @@ async def _drive(
             id_exp, expediente_ref, downloaded_files = await _capture_receipt(
                 page, context, work_dir, console, id_borr=id_borr,
             )
-            external_id = expediente_ref or id_exp or id_borr
+            # Successful signing must produce either an idExp or an
+            # expedienteRef. If we only have idBorr, the firma never
+            # completed and the request is still a draft — fail loudly
+            # so the user knows to retry instead of seeing a misleading
+            # success notification.
+            if not id_exp and not expediente_ref:
+                raise RuntimeError(
+                    f"firma_no_registrada: solo tenemos idBorr={id_borr!r}, "
+                    f"el portal no devolvió idExp ni expedienteRef "
+                    f"(URL final: {page.url}). La solicitud quedó como borrador."
+                )
+            external_id = expediente_ref or id_exp
             justificante_path = downloaded_files.get("Justificante") or downloaded_files.get("Solicitud")
         except Exception as e:
             await _capture_failure(page, work_dir, "filler_failed")
@@ -322,10 +342,16 @@ async def _step2_fill_request(page, payload: dict, console) -> None:
 
 async def _step2_submit_capture_id_borr(page, console) -> Optional[str]:
     """Click "Siguiente" and wait for the URL to flip to /procedimiento/firma
-    with ?idBorr=…. The portal mints the borrador on this transition."""
+    with ?idBorr=…. The portal mints the borrador on this transition.
+
+    The mint involves a server round-trip with a spinner — observed up to
+    ~40s in the wild — so the wait is generous. A real validation error
+    leaves the URL on /procedimiento/formulario; only collect errors after
+    the wait actually times out.
+    """
     await _click_dnt_button(page, "Siguiente")
     try:
-        await page.wait_for_url("**/procedimiento/firma?**", timeout=30_000)
+        await page.wait_for_url("**/procedimiento/firma?**", timeout=180_000)
     except Exception:
         # Maybe validation errors on step 2.
         errors = await _collect_validation_errors(page)
@@ -361,11 +387,12 @@ async def _step3_sign(page, console) -> None:
     #   (a) navigation to clave.gob.es / pasarela-ident.clave.gob.es
     #   (b) inline transition to the confirmation page (no clave bounce)
     # Wait for ANY navigation off /procedimiento/firma OR the appearance
-    # of a clave URL.
+    # of a clave URL. Server side this can be slow (mint of signValidation
+    # token + SAML AuthnRequest), so the timeout is generous.
     try:
         await page.wait_for_url(
             lambda url: ("clave.gob.es" in url) or ("/procedimiento/firma" not in url),
-            timeout=30_000,
+            timeout=120_000,
         )
     except Exception:
         errors = await _collect_validation_errors(page)
@@ -378,12 +405,24 @@ async def _step3_sign(page, console) -> None:
     # the user hasn't completed the cert picker yet), we time out.
     if "clave.gob.es" in page.url:
         console.print("[dim]transparencia: pasarela Cl@ve detectada para confirmación de firma[/]")
-        # Auto-click "DNIe / Certificado electrónico" if visible (matches
-        # the present_complaint flow).
-        try:
-            await page.locator('button[onclick*="AFIRMA"]').first.click(timeout=8_000)
-        except Exception:
-            pass
+        # Try a few selectors for the AFIRMA / DNIe option in case the
+        # markup changes between runs (same set as the warm-up handshake).
+        selectors = [
+            'button[onclick*="AFIRMA"]',
+            'button[onclick*="afirma"]',
+            'a[href*="AFIRMA"]',
+            'button:has-text("DNIe")',
+            'button:has-text("Certificado electrónico")',
+        ]
+        for sel in selectors:
+            try:
+                btn = page.locator(sel).first
+                await btn.wait_for(state="visible", timeout=5_000)
+                await btn.click()
+                console.print(f"[dim]transparencia: AFIRMA clic via {sel!r} (firma)[/]")
+                break
+            except Exception:
+                continue
         try:
             await page.wait_for_url("**/transparencia.sede.gob.es/**", timeout=180_000)
             console.print("[green]transparencia: vuelta de Cl@ve OK[/]")
@@ -393,18 +432,25 @@ async def _step3_sign(page, console) -> None:
                 f"transparencia: timeout esperando vuelta de Cl@ve tras la firma ({page.url})"
             ) from e
 
-    # Final wait: confirm we left the firma page (could land on a
-    # /procedimiento/recibo or similar — to be confirmed in discovery).
+    # Final wait: confirm we left /procedimiento/firma. The portal lands on
+    # /procedimiento/confirmacionSolicitud?idExp=N when registration succeeds.
+    #
+    # We used to be lenient about ``signValidation`` in the URL but that's a
+    # FALSE positive: the portal stamps signValidation while the borrador is
+    # still pending non-repudiation confirmation, NOT after success. Treating
+    # it as success caused the task to report success while the request
+    # stayed as a draft on the portal. Require the URL to actually leave
+    # /procedimiento/firma.
     try:
         await page.wait_for_url(
             lambda url: "/procedimiento/firma" not in url,
-            timeout=20_000,
+            timeout=120_000,
         )
-    except Exception:
-        # Some portals redirect to firma?…&signValidation=… on success too;
-        # be lenient if the validation parameter is now present.
-        if "signValidation" not in page.url:
-            raise
+    except Exception as e:
+        raise RuntimeError(
+            f"step3_stuck_on_firma: la firma no se completó, el portal sigue en {page.url} "
+            "(probablemente la solicitud quedó como borrador)"
+        ) from e
 
 
 async def _capture_receipt(
@@ -618,26 +664,66 @@ async def _check_all_dnt_checkboxes(page) -> None:
 async def _click_dnt_button(page, label: str) -> None:
     """Click a `<dnt-button>` whose visible text matches the given label.
 
-    The host re-emits clicks via an inner anchor in the shadow root; we
-    click the inner element when present, otherwise we click the host
-    (which Stencil registers a listener on)."""
-    clicked = await page.evaluate(
+    Uses Playwright's real mouse click (dispatches mousedown → mouseup →
+    click) on the host element rather than a synthetic ``inner.click()``
+    from JS.
+
+    Discovery (2026-05-04): step-2 submits were rejected with a generic
+    "formato no válido" until we switched to a real click. dnt-button's
+    pre-submit pipeline relies on ``mousedown`` to commit any pending
+    state on the dnt-input siblings; a bare JS click skips that and the
+    form sees the still-"pending" inputs as malformed even though their
+    visible values are correct. A manual user click on the same form
+    advanced without changes — confirming the click mechanism is what
+    matters, not the field values.
+
+    ``:has-text`` doesn't pierce the dnt-button shadow root, so we tag
+    the matching host with a data attribute via JS and click that
+    selector through Playwright.
+    """
+    label_norm = label.strip().lower()
+    tagged = await page.evaluate(
         """(args) => {
-            const buttons = [...document.querySelectorAll('dnt-button')];
+            for (const el of document.querySelectorAll('dnt-button[data-pideinfo-click]')) {
+                el.removeAttribute('data-pideinfo-click');
+            }
+            // The wizard renders all 3 steps at once and toggles visibility
+            // on the inactive ones, so several "Siguiente" buttons coexist.
+            // Filter to the visible ones — the one inside the active step
+            // is the only clickable target.
+            const isVisible = (el) => {
+                const cs = getComputedStyle(el);
+                if (cs.display === 'none' || cs.visibility === 'hidden') return false;
+                if (el.offsetParent === null && cs.position !== 'fixed') return false;
+                const rect = el.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+            };
+            const buttons = [...document.querySelectorAll('dnt-button')].filter(isVisible);
             const target = buttons.find(b => {
                 const txt = (b.shadowRoot && b.shadowRoot.textContent) || b.textContent || '';
-                return txt.trim().toLowerCase() === args.label.trim().toLowerCase();
+                return txt.trim().toLowerCase() === args.label;
             });
             if (!target) return false;
-            const sr = target.shadowRoot;
-            const inner = sr && (sr.querySelector('button') || sr.querySelector('a'));
-            if (inner) { inner.click(); } else { target.click(); }
+            target.setAttribute('data-pideinfo-click', 'target');
             return true;
         }""",
-        {"label": label},
+        {"label": label_norm},
     )
-    if not clicked:
-        raise RuntimeError(f"dnt_button_not_found: label={label!r}")
+    if not tagged:
+        raise RuntimeError(f"dnt_button_not_found_or_hidden: label={label!r}")
+    try:
+        await page.click('dnt-button[data-pideinfo-click="target"]')
+    finally:
+        try:
+            await page.evaluate(
+                """() => {
+                    for (const el of document.querySelectorAll('dnt-button[data-pideinfo-click]')) {
+                        el.removeAttribute('data-pideinfo-click');
+                    }
+                }"""
+            )
+        except Exception:
+            pass
 
 
 async def _is_step_active(page, step_index: int) -> bool:
@@ -690,12 +776,91 @@ def _extract_query_param(url: str, key: str) -> Optional[str]:
 
 
 def _is_headed_debug(settings) -> bool:
-    return bool(getattr(settings, "headless_disabled", False) or os.getenv("HEADLESS_DISABLED", "").lower() == "true")
+    from storage.preferences import is_headless_disabled
+    return is_headless_disabled(settings)
 
 
 def _utcnow_iso() -> str:
     from datetime import datetime, timezone
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+async def _warm_up_clave_session(page, portal_url: str, console) -> None:
+    """Trigger a silent Cl@ve handshake inside the current Firefox context so
+    transparencia.sede.gob.es session cookies land in the in-memory cookie
+    jar before we navigate to ``/procedimiento/formulario``.
+
+    Hits ``/claveproxy/clave/authenticate?returnUrl=/privada/expedientes`` →
+    if Cl@ve shows the IdP picker, click AFIRMA → cert is auto-selected
+    from the trained profile → portal stamps session cookies → land at
+    ``/privada/expedientes``.
+
+    Cookies on ``*.clave.gob.es`` are session-only too, so the IdP picker
+    may appear on every cold start; we always click through it explicitly
+    rather than counting on a remembered choice.
+    """
+    import urllib.parse
+    from auth.session_manager import SessionExpiredError
+
+    return_url = urllib.parse.quote(f"{portal_url}/privada/expedientes")
+    target = f"{portal_url}/claveproxy/clave/authenticate?returnUrl={return_url}"
+
+    await page.goto(target, wait_until="domcontentloaded")
+
+    # If we already landed back at the portal (cached session lucky path), done.
+    if "transparencia.sede.gob.es" in page.url and "claveproxy" not in page.url:
+        if "/privada/expedientes" in page.url:
+            console.print("[dim]transparencia: sesión Cl@ve aún viva, sin pasarela[/]")
+            return
+
+    # Otherwise we should be on the Cl@ve pasarela. Pick AFIRMA explicitly —
+    # try a few selectors in case the markup changes.
+    if "clave.gob.es" in page.url or "claveproxy" in page.url:
+        clicked = False
+        selectors = [
+            'button[onclick*="AFIRMA"]',
+            'button[onclick*="afirma"]',
+            'a[href*="AFIRMA"]',
+            'button:has-text("DNIe")',
+            'button:has-text("Certificado electrónico")',
+        ]
+        for sel in selectors:
+            try:
+                btn = page.locator(sel).first
+                await btn.wait_for(state="visible", timeout=5_000)
+                await btn.click()
+                clicked = True
+                console.print(f"[dim]transparencia: AFIRMA clic via {sel!r}[/]")
+                break
+            except Exception:
+                continue
+        if not clicked:
+            raise SessionExpiredError(
+                f"transparencia: pasarela Cl@ve sin botón AFIRMA reconocible ({page.url})"
+            )
+
+    # Wait for navigation back to the portal. Treat /error/ as a definite fail
+    # so we surface a useful diagnostic instead of sitting until the timeout.
+    try:
+        await page.wait_for_url(
+            lambda url: "transparencia.sede.gob.es" in url and "claveproxy" not in url,
+            timeout=180_000,
+        )
+    except Exception as e:
+        raise SessionExpiredError(
+            f"transparencia: warm-up de Cl@ve no volvió al portal ({page.url})"
+        ) from e
+
+    if "/error/" in page.url:
+        raise SessionExpiredError(
+            f"transparencia: warm-up de Cl@ve devolvió error del portal ({page.url})"
+        )
+    if "/privada/expedientes" not in page.url:
+        raise SessionExpiredError(
+            f"transparencia: warm-up de Cl@ve aterrizó fuera de /privada/expedientes ({page.url})"
+        )
+
+    console.print("[dim]transparencia: sesión Cl@ve refrescada[/]")
 
 
 async def _capture_failure(page, work_dir: Path, label: str) -> None:

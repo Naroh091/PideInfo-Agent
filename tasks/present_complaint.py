@@ -27,6 +27,11 @@ def _downloads_dir() -> Path:
     return Path.home() / "Downloads" / "PideInfo"
 
 
+def _is_headed_debug(settings) -> bool:
+    from storage.preferences import is_headless_disabled
+    return is_headless_disabled(settings)
+
+
 def handle(task: dict, client: Any) -> None:
     """Synchronous entry point invoked by `tasks.dispatch_existing`.
 
@@ -134,10 +139,14 @@ async def _drive_form(
             "browser.sessionstore.resume_from_crash": False,
             "browser.startup.page": 0,
         }
-        # Always headed: the user needs to see the form to sign on step 5.
+        # Headless by default. CTBG step 5 is a plain Wicket submit (no
+        # AutoFirma / no PKI dialog), so the wizard runs end-to-end without
+        # user interaction. Set HEADLESS_DISABLED=true (or
+        # ``settings.headless_disabled``) to debug visually.
+        headless = not _is_headed_debug(settings)
         context = await p.firefox.launch_persistent_context(
             user_data_dir=str(profile_dir),
-            headless=False,
+            headless=headless,
             firefox_user_prefs=firefox_user_prefs,
             locale="es-ES",
             ignore_https_errors=True,
