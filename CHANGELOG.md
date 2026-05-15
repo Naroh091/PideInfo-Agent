@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.6.0](https://github.com/Naroh091/PideInfo-Agent/compare/v0.5.0...v0.6.0) (2026-05-15)
+
+
+### Features
+
+* REG ([6522d39](https://github.com/Naroh091/PideInfo-Agent/commit/6522d39f4ab729283692979b7045a672c0ac834a))
+* REG ([885b17a](https://github.com/Naroh091/PideInfo-Agent/commit/885b17a93d55b2715e061d5ff0333591a1160ca5))
+
+
+### Bug Fixes
+
+* reg implementation ([e848b55](https://github.com/Naroh091/PideInfo-Agent/commit/e848b55c5c5384206b9e62ac89296c3dbdea871c))
+
 ## [0.5.0](https://github.com/Naroh091/PideInfo-Agent/compare/v0.4.0...v0.5.0) (2026-05-11)
 
 
