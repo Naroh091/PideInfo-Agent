@@ -613,19 +613,58 @@ async def _step4_firma_y_justificante(
 
     # Descarga del justificante. REG expone un ``dnt-button`` con texto
     # "Descargar justificante" que dispara un GET autenticado al
-    # ``reg-api.redsara.es/documents/uuid/{doc_uuid}`` y devuelve el PDF;
-    # Playwright lo intercepta como un download nativo.
+    # ``reg-api.redsara.es/documents/uuid/{doc_uuid}`` y devuelve el PDF.
+    # El backend tarda unos segundos tras la firma en tener el documento
+    # listo: si lo pedimos demasiado pronto, REG redirige a una página de
+    # error con "La URL solicitada no existe". Por eso (a) esperamos a
+    # que el botón esté visible y (b) reintentamos con backoff si el
+    # primer intento devuelve una página de error en vez de un download.
     justificante_path: Optional[Path] = None
     try:
-        async with page.expect_download(timeout=30_000) as download_info:
-            await _click_button(page, "Descargar justificante")
-        download = await download_info.value
-        target = work_dir / f"justificante_{registry_number or 'reg'}.pdf"
-        await download.save_as(target)
-        justificante_path = target
-        console.print(f"[dim]→ Justificante: {target} ({target.stat().st_size} bytes)[/]")
-    except Exception as e:
-        console.print(f"[yellow]REG: no se pudo descargar justificante automáticamente ({e})[/]")
+        await page.get_by_text("Descargar justificante", exact=False).first.wait_for(
+            state="visible", timeout=30_000
+        )
+    except Exception:
+        console.print("[yellow]REG: botón 'Descargar justificante' no apareció a tiempo[/]")
+
+    last_err: Optional[str] = None
+    for attempt in range(1, 5):  # ~5 + 8 + 12 + 18 = ~43 s
+        try:
+            async with page.expect_download(timeout=20_000) as download_info:
+                await _click_button(page, "Descargar justificante")
+            download = await download_info.value
+            target = work_dir / f"justificante_{registry_number or 'reg'}.pdf"
+            await download.save_as(target)
+            justificante_path = target
+            console.print(f"[dim]→ Justificante: {target} ({target.stat().st_size} bytes)[/]")
+            break
+        except Exception as e:
+            last_err = str(e)
+            # Si la página muestra el mensaje de error de SARA, esperamos
+            # más antes de reintentar — el doc_uuid aún no está vivo.
+            page_text = ""
+            try:
+                page_text = await page.locator("body").inner_text(timeout=2_000)
+            except Exception:
+                pass
+            if "URL solicitada no existe" in page_text or "no existe" in page_text.lower():
+                console.print(
+                    f"[yellow]REG: justificante aún no disponible (intento {attempt}/4) — reintentando[/]"
+                )
+                # Volver atrás para reactivar el botón si la página fue a /error
+                try:
+                    await page.go_back(wait_until="domcontentloaded")
+                except Exception:
+                    pass
+            else:
+                console.print(
+                    f"[yellow]REG: descarga del justificante falló (intento {attempt}/4): {e}[/]"
+                )
+            await asyncio.sleep(min(5 * attempt, 18))
+    else:
+        console.print(
+            f"[yellow]REG: no se pudo descargar justificante automáticamente tras 4 intentos ({last_err})[/]"
+        )
 
     return registry_number, justificante_path
 
