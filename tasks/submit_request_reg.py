@@ -374,21 +374,54 @@ _FILL_STEP2_TEXTS_JS = (
 """
 )
 
-# Pulsa la primera dnt-option dentro del autocompletar de organismo cuyo
-# texto empiece por el código DIR3 buscado.
+# Busca atómicamente la dnt-option cuyo *unidad principal* (el primer
+# <span> con la clase dnt-txt-body-350) coincide con el DIR3 buscado y
+# la clica. Importante:
+#   - REG renderiza TODA la jerarquía (unidad + organismo intermedio +
+#     organismo raíz) dentro de UNA sola dnt-option como <span>+<p>+<p>,
+#     así que el textContent concatenado mezcla los tres DIR3. Por eso
+#     comparamos contra el primer <span> (la unidad seleccionable), no
+#     contra textContent completo, para no clicar accidentalmente la
+#     opción cuando lo que matchea es el organismo padre.
+#   - Sondeo interno con timeout: el XHR /dir3/search puede tardar y el
+#     CDK overlay re-pinta la lista; combinar espera y click elimina la
+#     ventana de carrera.
+#   - En no_match devuelve las opciones realmente renderizadas para
+#     diagnosticar (typo, organismo dado de baja, etc.).
 _PICK_DESTINATION_JS = r"""
-(dir3) => {
-  const ds = document.querySelector('dnt-select#destinationOrganism');
-  if (!ds) return 'no_select';
-  for (const opt of ds.querySelectorAll('dnt-option')) {
-    const div = opt.shadowRoot?.querySelector('div[role="option"]');
-    const text = (div?.textContent || opt.textContent || '').trim();
-    if (text.startsWith(dir3)) {
-      (div || opt).click();
-      return 'ok';
+async ({ dir3, timeoutMs }) => {
+  const target = String(dir3 || '').trim().toLowerCase();
+  // El <span> con dnt-txt-body-350 es la unidad seleccionable; los <p>
+  // con dnt-txt-body-200 son la cadena padres → raíz, no clicables como
+  // entidad propia desde aquí.
+  const unitText = opt => {
+    const span = opt.querySelector('span.dnt-txt-body-350, span');
+    return ((span?.textContent) || '').trim();
+  };
+  const findMatch = () => {
+    const ds = document.querySelector('dnt-select#destinationOrganism');
+    if (!ds) return { ds: null, opt: null };
+    const opts = Array.from(ds.querySelectorAll('dnt-option'));
+    let opt = opts.find(o => unitText(o).toLowerCase().startsWith(target));
+    if (!opt) opt = opts.find(o => unitText(o).toLowerCase().includes(target));
+    return { ds, opt };
+  };
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const { ds, opt } = findMatch();
+    if (opt) {
+      const span = opt.querySelector('span.dnt-txt-body-350, span');
+      (span || opt).click();
+      return { status: 'ok', text: unitText(opt) };
     }
+    if (!ds) return { status: 'no_select' };
+    await new Promise(r => setTimeout(r, 200));
   }
-  return 'no_match';
+  const ds = document.querySelector('dnt-select#destinationOrganism');
+  const options = ds
+    ? Array.from(ds.querySelectorAll('dnt-option')).map(o => unitText(o).slice(0, 120))
+    : null;
+  return { status: 'no_match', options };
 }
 """
 
@@ -412,22 +445,41 @@ async def _step2_solicitud(page, destination: dict, request: dict, console) -> N
     # 3. Click en la opción cuyo texto empieza por el DIR3.
     dest_select = page.locator("dnt-select#destinationOrganism")
     await dest_select.scroll_into_view_if_needed()
-    await dest_select.click()
-    await page.keyboard.type(unit_dir3, delay=40)
-    # Espera a que la opción aparezca (XHR + render).
-    try:
-        await page.wait_for_function(
-            "(dir3) => { const ds = document.querySelector('dnt-select#destinationOrganism'); "
-            "return ds && Array.from(ds.querySelectorAll('dnt-option')).some(o => "
-            "(o.shadowRoot?.querySelector('div[role=\"option\"]')?.textContent || o.textContent || '').trim().startsWith(dir3)); }",
-            arg=unit_dir3,
-            timeout=15_000,
-        )
-    except Exception as e:
-        raise RuntimeError(f"destination_dir3_not_found:{unit_dir3}") from e
-    pick_result = await page.evaluate(_PICK_DESTINATION_JS, unit_dir3)
-    if pick_result != "ok":
-        raise RuntimeError(f"destination_pick_failed:{pick_result}")
+    # El <dnt-select> es un wrapper plano (~21 px); el <input> combobox
+    # real vive dentro del shadow de su <dnt-input>, ~36 px más abajo.
+    # Clicar el host no foca el input → page.keyboard.type cae en body
+    # y NUNCA se dispara el XHR /dir3/search. Hay que clicar el input
+    # real con coordenadas reales para que reciba foco.
+    input_coords = await page.evaluate(
+        """() => {
+          const ds = document.querySelector('dnt-select#destinationOrganism');
+          const dntInput = ds?.shadowRoot?.querySelector('dnt-input[role="combobox"]');
+          const real = dntInput?.shadowRoot?.querySelector('input.dnt-input__inner');
+          if (!real) return null;
+          const r = real.getBoundingClientRect();
+          return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+        }"""
+    )
+    if not input_coords:
+        raise RuntimeError("destination_combobox_input_not_found")
+    await page.mouse.click(input_coords["x"], input_coords["y"])
+    await page.keyboard.type(unit_dir3, delay=80)
+    # Esperar a que la opción aparezca y clicarla en una sola operación
+    # atómica — el CDK overlay re-pinta la lista varias veces durante el
+    # XHR de búsqueda, así que entre `wait_for_function` y el click puede
+    # cambiar el DOM. El JS hace polling interno (timeout 15 s).
+    pick_result = await page.evaluate(_PICK_DESTINATION_JS, {"dir3": unit_dir3, "timeoutMs": 15_000})
+    status = (pick_result or {}).get("status")
+    if status == "ok":
+        console.print(f"[dim]REG paso 2: destino seleccionado → {pick_result.get('text')!r}[/]")
+    else:
+        opts = (pick_result or {}).get("options")
+        if status == "no_match" and opts is not None:
+            preview = ", ".join(opts[:5]) if opts else "(lista vacía)"
+            raise RuntimeError(
+                f"destination_pick_failed:no_match dir3={unit_dir3!r} options=[{preview}]"
+            )
+        raise RuntimeError(f"destination_pick_failed:{status or 'unknown'}")
 
     # ── Asunto, EXPONE, SOLICITA ───────────────────────────────────────
     # Límites reales de REG: asunto 80 chars, expone/solicita 4000.
