@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.6.3](https://github.com/Naroh091/PideInfo-Agent/compare/v0.6.2...v0.6.3) (2026-05-16)
+
+
+### Bug Fixes
+
+* download confirmation after REG process ([768bf04](https://github.com/Naroh091/PideInfo-Agent/commit/768bf047e5fbd6d973afbbf2606898113d5c6a7f))
+* REG justificante download retries when SARA returns "URL no existe" ([e997604](https://github.com/Naroh091/PideInfo-Agent/commit/e997604457a159ba21293bad270a0de2b9745f6d))
+* REG justificante downloads via API instead of UI popup-prone button ([0e697ff](https://github.com/Naroh091/PideInfo-Agent/commit/0e697ffb4e0afcfc670740544870328b84387415))
+
 ## [0.6.2](https://github.com/Naroh091/PideInfo-Agent/compare/v0.6.1...v0.6.2) (2026-05-16)
 
 
