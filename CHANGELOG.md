@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.6.2](https://github.com/Naroh091/PideInfo-Agent/compare/v0.6.1...v0.6.2) (2026-05-16)
+
+
+### Bug Fixes
+
+* REG justificante upload uses canonical client method ([47be977](https://github.com/Naroh091/PideInfo-Agent/commit/47be9778c3b17d46b2df7d7b4c76108933f956e7))
+* REG justificante upload uses canonical client method ([55211ac](https://github.com/Naroh091/PideInfo-Agent/commit/55211ac75167400f9494ca73a11e9a3c53839151))
+
 ## [0.6.1](https://github.com/Naroh091/PideInfo-Agent/compare/v0.6.0...v0.6.1) (2026-05-16)
 
 
