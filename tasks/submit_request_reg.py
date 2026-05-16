@@ -182,19 +182,36 @@ async def _drive(
         promote_to_master(profile_dir, settings.firefox_profile_master)
 
     # Subir justificante al backend vía webhook (source=redsara_rec).
+    # Reusamos el método canónico del cliente — el sync de fondo de Red
+    # SARA usa el mismo, así el backend procesa el justificante por la
+    # misma ruta esté quien esté generándolo.
     upload_summary = None
     if justificante_path and justificante_path.exists():
+        from models.redsara import RedSaraRegistro
+
+        registro = RedSaraRegistro(
+            registry_number=registry_number or "",
+            registry_number_temporary="",
+            status="Enviado",
+            entry_date=_utcnow_iso(),
+            destiny_organism=payload["destination"].get("unit_name") or "",
+            subject=(payload["request"].get("title") or "")[:200],
+            act_like="Interesado",
+            uuid="",
+            app_user="REG",
+        )
         try:
-            upload_summary = await _upload_justificante(
-                client,
-                access_request_id=payload["access_request_id"],
-                registry_number=registry_number,
-                pdf_path=justificante_path,
-                destination_name=payload["destination"].get("unit_name") or "",
-                subject=payload["request"].get("title") or "",
-            )
-        except Exception:
+            upload_summary = await client.sync_redsara_document(registro, justificante_path)
+        except Exception as e:
             logger.exception("upload of justificante failed")
+            console.print(
+                f"[bold yellow]REG {registry_number or ''}: justificante NO subido al backend → {e}. "
+                f"PDF local: {justificante_path}[/]"
+            )
+    elif registry_number:
+        console.print(
+            f"[bold yellow]REG {registry_number}: justificante no descargado, nada que subir al backend.[/]"
+        )
 
     return {
         "mode": mode,
@@ -611,55 +628,6 @@ async def _step4_firma_y_justificante(
         console.print(f"[yellow]REG: no se pudo descargar justificante automáticamente ({e})[/]")
 
     return registry_number, justificante_path
-
-
-# ─────────────────────────────────────────────────────────────────────────
-# Webhook upload
-# ─────────────────────────────────────────────────────────────────────────
-
-
-async def _upload_justificante(
-    client,
-    *,
-    access_request_id: str,
-    registry_number: Optional[str],
-    pdf_path: Path,
-    destination_name: str,
-    subject: str,
-) -> dict:
-    import base64
-    import hashlib
-
-    import httpx
-
-    content = pdf_path.read_bytes()
-    payload = {
-        "source": "redsara_rec",
-        "expedienteRef": registry_number or "",
-        "documents": [
-            {
-                "filename": f"Justificante - {registry_number or 'REG'}.pdf",
-                "contentType": "application/pdf",
-                "content": base64.b64encode(content).decode("ascii"),
-                "contentHash": hashlib.sha256(content).hexdigest(),
-            }
-        ],
-        "metadata": {
-            "access_request_id": access_request_id,
-            "registryNumber": registry_number,
-            "destinyOrganism": destination_name,
-            "subject": subject,
-        },
-    }
-
-    async with httpx.AsyncClient(timeout=120) as http:
-        r = await http.post(
-            client._webhook_url,
-            json=payload,
-            headers={**client._auth_headers, "Content-Type": "application/json"},
-        )
-        r.raise_for_status()
-        return r.json()
 
 
 # ─────────────────────────────────────────────────────────────────────────
