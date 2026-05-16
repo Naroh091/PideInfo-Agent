@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.6.1](https://github.com/Naroh091/PideInfo-Agent/compare/v0.6.0...v0.6.1) (2026-05-16)
+
+
+### Bug Fixes
+
+* REG destination picker focuses real combobox input ([3e4885e](https://github.com/Naroh091/PideInfo-Agent/commit/3e4885e253d4bfbf65857582ce60728146ee2c06))
+* REG destination picker focuses real combobox input ([d1bd45e](https://github.com/Naroh091/PideInfo-Agent/commit/d1bd45ebea83954d5df77ccba29cab96d9b9a4bf))
+
 ## [0.6.0](https://github.com/Naroh091/PideInfo-Agent/compare/v0.5.0...v0.6.0) (2026-05-15)
 
 
