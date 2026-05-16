@@ -166,9 +166,7 @@ async def _drive(
 
             client.progress_task(task_id, status="in_progress", note="Paso 4: Firma")
             await _wait_step_active(page, 4)
-            registry_number, justificante_path = await _step4_firma_y_justificante(
-                page, context, work_dir, console
-            )
+            registry_number, registry_uuid = await _step4_firma(page, context, console)
         except Exception as e:
             await _capture_failure(page, work_dir, "filler_failed")
             if settings.debug:
@@ -180,6 +178,17 @@ async def _drive(
             raise
 
         promote_to_master(profile_dir, settings.firefox_profile_master)
+
+    # Descargar justificante vía API directa (mismo camino que el sync
+    # de fondo de Red SARA). Saltarse la UI evita el popup "URL
+    # solicitada no existe" que aparece si el doc_uuid aún no está
+    # vivo: aquí podemos reintentar limpiamente la llamada API.
+    justificante_path: Optional[Path] = None
+    if registry_uuid:
+        client.progress_task(task_id, status="in_progress", note="Descargando justificante")
+        justificante_path = await _download_justificante_via_api(
+            session_manager, registry_uuid, registry_number, work_dir, console
+        )
 
     # Subir justificante al backend vía webhook (source=redsara_rec).
     # Reusamos el método canónico del cliente — el sync de fondo de Red
@@ -197,7 +206,7 @@ async def _drive(
             destiny_organism=payload["destination"].get("unit_name") or "",
             subject=(payload["request"].get("title") or "")[:200],
             act_like="Interesado",
-            uuid="",
+            uuid=registry_uuid or "",
             app_user="REG",
         )
         try:
@@ -519,19 +528,25 @@ async def _step3_documentacion(page, pdf_path: Path, console) -> None:
     await page.wait_for_timeout(1_500)
 
 
-async def _step4_firma_y_justificante(
+async def _step4_firma(
     page,
     context,
-    work_dir: Path,
     console,
-) -> tuple[Optional[str], Optional[Path]]:
-    """Firma con Cl@ve y captura el REGAGE + justificante PDF.
+) -> tuple[Optional[str], Optional[str]]:
+    """Firma con Cl@ve y devuelve ``(REGAGE, registry_uuid)``.
 
     Pasos: (1) marcar el checkbox ``checkTerms``; (2) pulsar
     "Firmar y registrar (Cl@ve)" — un ``dnt-split-button`` cuyo botón
     principal lanza la pasarela Cl@ve. Si el certificado FNMT está
     pre-cargado en el perfil de Firefox, el bounce es silencioso y al
-    volver REG muestra el REGAGE + "Descargar justificante".
+    volver REG nos deja en ``/es/detalle-registro/{uuid}``.
+
+    El justificante NO se descarga desde la UI: el botón "Descargar
+    justificante" apunta a una URL que tarda unos segundos en estar
+    viva y, mientras tanto, abre un popup "La URL solicitada no
+    existe". Sacamos el UUID del registro de la URL y descargamos por
+    API directa (``reg-api.redsara.es/documents/uuid/…``) más tarde,
+    fuera del flujo del browser.
     """
     # Marcar checkbox de confirmación antes de firmar (si no, el botón
     # de firmar queda deshabilitado).
@@ -611,23 +626,70 @@ async def _step4_firma_y_justificante(
         if m:
             registry_number = m.group(0)
 
-    # Descarga del justificante. REG expone un ``dnt-button`` con texto
-    # "Descargar justificante" que dispara un GET autenticado al
-    # ``reg-api.redsara.es/documents/uuid/{doc_uuid}`` y devuelve el PDF;
-    # Playwright lo intercepta como un download nativo.
-    justificante_path: Optional[Path] = None
-    try:
-        async with page.expect_download(timeout=30_000) as download_info:
-            await _click_button(page, "Descargar justificante")
-        download = await download_info.value
-        target = work_dir / f"justificante_{registry_number or 'reg'}.pdf"
-        await download.save_as(target)
-        justificante_path = target
-        console.print(f"[dim]→ Justificante: {target} ({target.stat().st_size} bytes)[/]")
-    except Exception as e:
-        console.print(f"[yellow]REG: no se pudo descargar justificante automáticamente ({e})[/]")
+    # UUID del registro: la URL tras la firma es
+    # https://reg.redsara.es/es/detalle-registro/{uuid}[/...]
+    registry_uuid: Optional[str] = None
+    m = re.search(r"/detalle-registro/([0-9a-f-]{36})", page.url, re.IGNORECASE)
+    if m:
+        registry_uuid = m.group(1)
+    else:
+        console.print(
+            f"[yellow]REG: no se pudo extraer registry_uuid de la URL ({page.url})[/]"
+        )
 
-    return registry_number, justificante_path
+    return registry_number, registry_uuid
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Justificante download (API directa, sin UI)
+# ─────────────────────────────────────────────────────────────────────────
+
+
+async def _download_justificante_via_api(
+    session_manager,
+    registry_uuid: str,
+    registry_number: Optional[str],
+    work_dir: Path,
+    console,
+) -> Optional[Path]:
+    """Descarga el justificante por la API REST de Red SARA.
+
+    Reusa ``RedSaraRecScraper.download_justificante`` (el mismo método
+    que el sync de fondo). Reintenta si el documento aún no está
+    indexado tras la firma — el backend SARA puede tardar varios
+    segundos en exponer el PDF en /documents/uuid/{doc_uuid}.
+    """
+    from portals.redsara_rec import RedSaraRecScraper
+
+    scraper = RedSaraRecScraper(session_manager)
+    target = work_dir / f"justificante_{registry_number or 'reg'}.pdf"
+
+    # 6 intentos × backoff 3/5/8/13/21/34 s ≈ 84 s totales
+    delays = [3, 5, 8, 13, 21, 34]
+    last_err: Optional[str] = None
+    for attempt, delay in enumerate(delays, start=1):
+        try:
+            ok = await scraper.download_justificante(registry_uuid, target)
+            if ok and target.exists() and target.stat().st_size > 0:
+                console.print(
+                    f"[dim]→ Justificante: {target} ({target.stat().st_size} bytes)[/]"
+                )
+                await scraper.close()
+                return target
+        except Exception as e:
+            last_err = str(e)
+        console.print(
+            f"[yellow]REG: justificante aún no disponible (intento {attempt}/{len(delays)}), reintento en {delay}s[/]"
+        )
+        await asyncio.sleep(delay)
+
+    await scraper.close()
+    console.print(
+        f"[bold yellow]REG: no se pudo descargar justificante tras {len(delays)} intentos"
+        + (f" — último error: {last_err}" if last_err else "")
+        + "[/]"
+    )
+    return None
 
 
 # ─────────────────────────────────────────────────────────────────────────
