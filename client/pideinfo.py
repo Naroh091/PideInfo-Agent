@@ -558,6 +558,12 @@ class PideInfoClient:
         avoiding a second crawl just to land the Consejo-generated phases
         (acuse, oficios, resolución…).
 
+        Hash-matchable submission docs (titles starting with SOLICITUD /
+        RECIBO / INSTANCIA) are sorted to the front of the batch so the
+        backend's hash fallback resolves the complaint on doc #1 and the
+        remaining Consejo-generated docs land against the resolved complaint
+        in the same pass.
+
         Per-doc fields (``complaint_phase``, ``csv``, ``documentTitle``)
         travel in each document's ``metadata`` block; expediente-level fields
         stay at the top level.
@@ -565,9 +571,21 @@ class PideInfoClient:
         if not docs:
             return {"created": [], "skipped": []}
 
+        # Hash-matchable submission docs first; the scraper's natural
+        # (chronological) order is preserved as the tiebreaker by sorted's
+        # stability.
+        sorted_docs = sorted(
+            docs,
+            key=lambda dp: (
+                0
+                if dp[0].title.lower().startswith(("recibo", "solicitud", "instancia"))
+                else 1
+            ),
+        )
+
         invalid: list[str] = []
         documents_payload: list[dict] = []
-        for doc, path in docs:
+        for doc, path in sorted_docs:
             suffix = path.suffix or ".pdf"
             # Avoid path separators in titles (e.g. "Resolución expte. 501/2026").
             safe_title = doc.title.replace("/", "-")

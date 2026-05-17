@@ -22,6 +22,7 @@ from rich.table import Table
 from auth.session_manager import SessionManager, SessionExpiredError
 from client.pideinfo import PideInfoClient
 from config import Settings
+from models.consejo_expediente import DocumentoCTBGExpediente
 from models.portal import Notificacion
 from notifier.desktop import (
     notify_auth_required,
@@ -485,7 +486,6 @@ async def _sync_consejo_expedientes(
     (``created``). Pre-existing duplicates rejected by hash dedup are not
     counted, matching the semantics of the AGE expediente sync.
     """
-    from models.consejo_expediente import DocumentoCTBGExpediente
     from portals.consejo_expediente import ConsejoExpedienteScraper
 
     ctbg_base = settings.portal_ctbg_base
