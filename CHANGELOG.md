@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.1](https://github.com/Naroh091/PideInfo-Agent/compare/v0.7.0...v0.7.1) (2026-05-17)
+
+
+### Bug Fixes
+
+* handle request UUID when sending REG ([ac24b63](https://github.com/Naroh091/PideInfo-Agent/commit/ac24b63f14932de3e08a0c4354755d96b1c8a907))
+
 ## [0.7.0](https://github.com/Naroh091/PideInfo-Agent/compare/v0.6.3...v0.7.0) (2026-05-17)
 
 
