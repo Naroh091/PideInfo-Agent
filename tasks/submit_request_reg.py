@@ -102,6 +102,8 @@ async def _drive(
     profile_dir = settings.firefox_profile_for("redsara")
     seed_from_master(profile_dir, settings.firefox_profile_master)
 
+    headed_debug = _is_headed_debug(settings)
+
     # Asegúrate de que el perfil Firefox tiene cookies frescas Cl@ve para reg.redsara.es.
     # RedSaraSessionManager se encarga de relanzar la autenticación si caducó.
     session_manager = RedSaraSessionManager(
@@ -110,7 +112,7 @@ async def _drive(
         auth_timeout=settings.auth_timeout_seconds,
         firefox_profile_dir=profile_dir,
         firefox_profile_master=settings.firefox_profile_master,
-        force_headed=False,
+        headless=not headed_debug,
     )
     await session_manager.get_valid_session()
 
@@ -132,7 +134,7 @@ async def _drive(
             "browser.sessionstore.resume_from_crash": False,
             "browser.startup.page": 0,
         }
-        headless = not _is_headed_debug(settings)
+        headless = not headed_debug
         context = await p.firefox.launch_persistent_context(
             user_data_dir=str(profile_dir),
             headless=headless,
@@ -164,9 +166,7 @@ async def _drive(
 
             client.progress_task(task_id, status="in_progress", note="Paso 4: Firma")
             await _wait_step_active(page, 4)
-            registry_number, justificante_path = await _step4_firma_y_justificante(
-                page, context, work_dir, console
-            )
+            registry_number, registry_uuid = await _step4_firma(page, context, console)
         except Exception as e:
             await _capture_failure(page, work_dir, "filler_failed")
             if settings.debug:
@@ -179,20 +179,48 @@ async def _drive(
 
         promote_to_master(profile_dir, settings.firefox_profile_master)
 
+    # Descargar justificante vía API directa (mismo camino que el sync
+    # de fondo de Red SARA). Saltarse la UI evita el popup "URL
+    # solicitada no existe" que aparece si el doc_uuid aún no está
+    # vivo: aquí podemos reintentar limpiamente la llamada API.
+    justificante_path: Optional[Path] = None
+    if registry_uuid:
+        client.progress_task(task_id, status="in_progress", note="Descargando justificante")
+        justificante_path = await _download_justificante_via_api(
+            session_manager, registry_uuid, registry_number, work_dir, console
+        )
+
     # Subir justificante al backend vía webhook (source=redsara_rec).
+    # Reusamos el método canónico del cliente — el sync de fondo de Red
+    # SARA usa el mismo, así el backend procesa el justificante por la
+    # misma ruta esté quien esté generándolo.
     upload_summary = None
     if justificante_path and justificante_path.exists():
+        from models.redsara import RedSaraRegistro
+
+        registro = RedSaraRegistro(
+            registry_number=registry_number or "",
+            registry_number_temporary="",
+            status="Enviado",
+            entry_date=_utcnow_iso(),
+            destiny_organism=payload["destination"].get("unit_name") or "",
+            subject=(payload["request"].get("title") or "")[:200],
+            act_like="Interesado",
+            uuid=registry_uuid or "",
+            app_user="REG",
+        )
         try:
-            upload_summary = await _upload_justificante(
-                client,
-                access_request_id=payload["access_request_id"],
-                registry_number=registry_number,
-                pdf_path=justificante_path,
-                destination_name=payload["destination"].get("unit_name") or "",
-                subject=payload["request"].get("title") or "",
-            )
-        except Exception:
+            upload_summary = await client.sync_redsara_document(registro, justificante_path)
+        except Exception as e:
             logger.exception("upload of justificante failed")
+            console.print(
+                f"[bold yellow]REG {registry_number or ''}: justificante NO subido al backend → {e}. "
+                f"PDF local: {justificante_path}[/]"
+            )
+    elif registry_number:
+        console.print(
+            f"[bold yellow]REG {registry_number}: justificante no descargado, nada que subir al backend.[/]"
+        )
 
     return {
         "mode": mode,
@@ -212,114 +240,283 @@ async def _drive(
 async def _step1_solicitante(page, solicitante: dict, console) -> None:
     """Rellena el Paso 1.
 
-    NIF + nombre + apellidos los pre-rellena Cl@ve. Aquí sólo rellenamos:
-      - radio "Interesado"
-      - dirección postal: tipo de vía, dirección, país (ES por defecto),
-        provincia, población, CP
-      - datos de contacto: teléfono, correo
-      - checkboxes "Deseo recibir avisos en correo/SMS"
+    REG usa web components con Shadow DOM (``dnt-input``, ``dnt-select``,
+    ``dnt-checkbox``, ``dnt-radio``); los inputs reales viven dentro del
+    shadow root, así que ``page.fill()`` y ``get_by_label()`` no llegan.
+    Inyectamos JS que perfora el shadow y hace los eventos que Angular
+    necesita (``InputEvent`` con ``data`` por carácter).
     """
     address = (solicitante or {}).get("address") or {}
+    payload = {
+        "typeRepresented": "Interesado",
+        "streetType": address.get("street_type") or "",
+        "streetName": address.get("line") or "",
+        "country": (address.get("country") or "ES"),
+        "province": address.get("province") or "",
+        "city": address.get("municipality") or "",
+        "zipCode": address.get("postal_code") or "",
+        "phone": solicitante.get("phone") or "",
+        "email": solicitante.get("email") or "",
+        "emailAlert": True,
+    }
+    failures = await page.evaluate(_FILL_STEP1_JS, payload)
+    if failures:
+        console.print(f"[yellow]REG paso 1: campos no rellenados: {failures}[/]")
 
-    # "¿Cómo quieres actuar?" → Interesado (default suele estarlo, pero
-    # forzamos por idempotencia).
-    try:
-        await _click_radio_by_label(page, "Interesado")
-    except RuntimeError as e:
-        console.print(f"[yellow]REG: radio 'Interesado' no encontrado: {e}[/]")
 
-    # Tipo de vía: mat-select con etiqueta "Tipo de vía".
-    if address.get("street_type"):
-        # PideInfo persiste la etiqueta exacta del select del REG (Calle,
-        # Avenida, Plaza, Camí…); la pasamos tal cual.
-        await _mat_select_by_label(page, "Tipo de vía", address["street_type"])
+# ─────────────────────────────────────────────────────────────────────────
+# Shadow-DOM helpers (run inside the page via page.evaluate)
+# ─────────────────────────────────────────────────────────────────────────
 
-    if address.get("line"):
-        await _mat_input_by_label(page, "Dirección", address["line"])
+# Helpers adaptados de un bookmarklet probado. REG usa custom elements
+# (``dnt-input``, ``dnt-select``, ``dnt-checkbox``, ``dnt-radio``) con
+# Shadow DOM, así que para escribir hay que:
+#   - perforar ``element.shadowRoot`` para llegar al input/textarea real
+#   - despachar ``InputEvent`` con ``data`` por carácter (Angular escucha
+#     ``valueChanges`` derivado de eso)
+# Los autocompletes (``dnt-select#destinationOrganism``) son la excepción:
+# requieren keystrokes REALES (vía ``page.keyboard.type``), no se disparan
+# con InputEvent sintético.
+_REG_HELPERS_JS = r"""
+const delay = ms => new Promise(r => setTimeout(r, ms));
+const visible = el => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
 
-    # País: por defecto España; sólo cambiamos si payload trae otro.
-    country = address.get("country") or "ES"
-    if country and country != "ES":
-        await _mat_select_by_label(page, "País", country)
+function fillInput(formControlName, text) {
+  const host = Array.from(document.querySelectorAll(
+    `dnt-input[formcontrolname="${formControlName}"]`
+  )).find(visible);
+  if (!host) return false;
+  const input = host.shadowRoot?.querySelector(
+    'input.dnt-input__inner, textarea.dnt-textarea__inner'
+  );
+  if (!input) return false;
+  input.focus();
+  input.value = '';
+  for (const ch of String(text)) {
+    input.value += ch;
+    input.dispatchEvent(new InputEvent('input', {
+      data: ch, inputType: 'insertText', bubbles: true, composed: true,
+    }));
+  }
+  input.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+  input.dispatchEvent(new Event('blur', { bubbles: true, composed: true }));
+  return true;
+}
 
-    if address.get("province"):
-        await _mat_select_by_label(page, "Provincia", address["province"])
+async function selectOption(idOrFcn, optionText) {
+  const host = Array.from(document.querySelectorAll(
+    `dnt-select#${idOrFcn},dnt-select[id="${idOrFcn}"],dnt-select[formcontrolname="${idOrFcn}"]`
+  )).find(visible);
+  if (!host) return false;
+  host.click();
+  await delay(300);
+  for (const opt of host.querySelectorAll('dnt-option')) {
+    const div = opt.shadowRoot?.querySelector('div[role="option"]');
+    const text = (div?.textContent || opt.textContent || '').trim();
+    if (text === optionText) {
+      (div || opt).click();
+      await delay(250);
+      return true;
+    }
+  }
+  document.body.click();
+  return false;
+}
 
-    if address.get("municipality"):
-        # Población: select dependiente de provincia. La etiqueta ya viene
-        # tal cual la muestra REG, así que un match exacto es suficiente.
-        await _mat_select_by_label(page, "Población", address["municipality"])
+function clickRadio(formControlName, value) {
+  const group = document.querySelector(
+    `dnt-radio-group[formcontrolname="${formControlName}"]`
+  );
+  if (!group) return false;
+  const radio = Array.from(group.querySelectorAll('dnt-radio'))
+    .find(r => (r.textContent || '').trim() === value);
+  if (!radio) return false;
+  const inner = radio.shadowRoot?.querySelector('input[type="radio"]');
+  (inner || radio).click();
+  return true;
+}
 
-    if address.get("postal_code"):
-        await _mat_input_by_label(page, "Código Postal", address["postal_code"])
+function checkBox(formControlName) {
+  const host = Array.from(document.querySelectorAll(
+    `dnt-checkbox[formcontrolname="${formControlName}"]`
+  )).find(visible);
+  if (!host) return false;
+  const inner = host.shadowRoot?.querySelector('input[type="checkbox"]');
+  if (inner?.checked) return true;
+  (inner || host).click();
+  return true;
+}
+"""
 
-    if solicitante.get("phone"):
-        await _mat_input_by_label(page, "Teléfono", solicitante["phone"])
+_FILL_STEP1_JS = (
+    "async (data) => {\n"
+    + _REG_HELPERS_JS
+    + r"""
+  const failed = [];
 
-    if solicitante.get("email"):
-        await _mat_input_by_label(page, "Correo electrónico", solicitante["email"])
+  if (data.typeRepresented && !clickRadio('typeRepresented', data.typeRepresented)) {
+    failed.push('typeRepresented');
+  }
+  await delay(200);
 
-    # Checkboxes "Deseo recibir avisos…": marcamos los dos.
-    await _check_checkboxes_matching(page, ["Deseo recibir avisos"])
+  if (data.streetType && !(await selectOption('streetType', data.streetType))) {
+    failed.push('streetType');
+  }
+  if (data.streetName && !fillInput('streetName', data.streetName)) {
+    failed.push('streetName');
+  }
+  if (data.country && data.country !== 'ES'
+      && !(await selectOption('country', data.country))) {
+    failed.push('country');
+  }
+  if (data.province && !(await selectOption('interested.province', data.province))) {
+    failed.push('province');
+  }
+  // city depende de province — espera al cascade
+  await delay(800);
+  if (data.city && !(await selectOption('interested.city', data.city))) {
+    failed.push('city');
+  }
+  if (data.zipCode && !fillInput('zipCode', data.zipCode)) failed.push('zipCode');
+  if (data.phone && !fillInput('phone', data.phone)) failed.push('phone');
+  if (data.email && !fillInput('email', data.email)) failed.push('email');
+  if (data.emailAlert && !checkBox('emailAlert')) failed.push('emailAlert');
+
+  return failed;
+}
+"""
+)
+
+_FILL_STEP2_TEXTS_JS = (
+    "async (data) => {\n"
+    + _REG_HELPERS_JS
+    + r"""
+  const failed = [];
+  if (data.subject && !fillInput('subject', data.subject)) failed.push('subject');
+  if (data.exposes && !fillInput('exposes', data.exposes)) failed.push('exposes');
+  if (data.solicit && !fillInput('solicit', data.solicit)) failed.push('solicit');
+  return failed;
+}
+"""
+)
+
+# Busca atómicamente la dnt-option cuyo *unidad principal* (el primer
+# <span> con la clase dnt-txt-body-350) coincide con el DIR3 buscado y
+# la clica. Importante:
+#   - REG renderiza TODA la jerarquía (unidad + organismo intermedio +
+#     organismo raíz) dentro de UNA sola dnt-option como <span>+<p>+<p>,
+#     así que el textContent concatenado mezcla los tres DIR3. Por eso
+#     comparamos contra el primer <span> (la unidad seleccionable), no
+#     contra textContent completo, para no clicar accidentalmente la
+#     opción cuando lo que matchea es el organismo padre.
+#   - Sondeo interno con timeout: el XHR /dir3/search puede tardar y el
+#     CDK overlay re-pinta la lista; combinar espera y click elimina la
+#     ventana de carrera.
+#   - En no_match devuelve las opciones realmente renderizadas para
+#     diagnosticar (typo, organismo dado de baja, etc.).
+_PICK_DESTINATION_JS = r"""
+async ({ dir3, timeoutMs }) => {
+  const target = String(dir3 || '').trim().toLowerCase();
+  // El <span> con dnt-txt-body-350 es la unidad seleccionable; los <p>
+  // con dnt-txt-body-200 son la cadena padres → raíz, no clicables como
+  // entidad propia desde aquí.
+  const unitText = opt => {
+    const span = opt.querySelector('span.dnt-txt-body-350, span');
+    return ((span?.textContent) || '').trim();
+  };
+  const findMatch = () => {
+    const ds = document.querySelector('dnt-select#destinationOrganism');
+    if (!ds) return { ds: null, opt: null };
+    const opts = Array.from(ds.querySelectorAll('dnt-option'));
+    let opt = opts.find(o => unitText(o).toLowerCase().startsWith(target));
+    if (!opt) opt = opts.find(o => unitText(o).toLowerCase().includes(target));
+    return { ds, opt };
+  };
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const { ds, opt } = findMatch();
+    if (opt) {
+      const span = opt.querySelector('span.dnt-txt-body-350, span');
+      (span || opt).click();
+      return { status: 'ok', text: unitText(opt) };
+    }
+    if (!ds) return { status: 'no_select' };
+    await new Promise(r => setTimeout(r, 200));
+  }
+  const ds = document.querySelector('dnt-select#destinationOrganism');
+  const options = ds
+    ? Array.from(ds.querySelectorAll('dnt-option')).map(o => unitText(o).slice(0, 120))
+    : null;
+  return { status: 'no_match', options };
+}
+"""
 
 
 async def _step2_solicitud(page, destination: dict, request: dict, console) -> None:
     """Rellena el Paso 2 (Datos de solicitud).
 
-    Selecciona la Unidad de destino por código DIR3 a través del buscador
-    que la propia UI de REG ofrece. Después rellena asunto, EXPONE y
-    SOLICITA (textareas independientes).
+    El select del organismo de destino es un autocomplete que solo se
+    dispara con keystrokes reales (Angular escucha teclado, no el
+    InputEvent sintético). Para los textos sí podemos usar el helper
+    shadow-DOM porque exposes/solicit son ``<textarea>`` planos.
     """
     unit_dir3 = destination.get("unit_dir3")
-    unit_name = destination.get("unit_name") or ""
     if not unit_dir3:
         raise RuntimeError("missing_destination_unit_dir3")
 
-    # ── Selección de Unidad de destino ─────────────────────────────────
-    # REG abre un modal de búsqueda; lo identificamos por el botón
-    # "Seleccionar unidad" o por el icono de lupa junto al campo
-    # "Unidad de destino". Discovery pendiente: aquí asumimos que el
-    # buscador acepta el código DIR3 y devuelve un único resultado.
-    try:
-        await page.get_by_role("button", name=re.compile("Unidad de destino|Seleccionar unidad|Buscar", re.I)).first.click(timeout=5_000)
-    except Exception:
-        # Fallback: a veces el campo es un input visible donde podemos
-        # teclear directamente.
-        await _mat_input_by_label(page, "Unidad de destino", unit_dir3)
-
-    # En el modal, escribir el DIR3 y elegir la fila correspondiente.
-    try:
-        search_box = page.get_by_role("textbox").last
-        await search_box.fill(unit_dir3, timeout=3_000)
-        # Esperar a que cargue el listado; pulsar la fila cuyo texto contiene el DIR3.
-        await page.wait_for_timeout(900)
-        row = page.locator(f"text=/{re.escape(unit_dir3)}/").first
-        await row.click(timeout=5_000)
-        # Confirmar la selección — botón "Aceptar" / "Seleccionar".
-        for label in ("Seleccionar", "Aceptar", "Confirmar"):
-            try:
-                await page.get_by_role("button", name=re.compile(label, re.I)).click(timeout=1_500)
-                break
-            except Exception:
-                continue
-    except Exception as e:
-        console.print(
-            f"[yellow]REG: no se pudo seleccionar Unidad por DIR3 ({unit_dir3}); "
-            f"probando con el nombre {unit_name!r}: {e}[/]"
-        )
-        # Fallback por nombre.
-        await _mat_input_by_label(page, "Unidad de destino", unit_name)
+    # ── Selección de Unidad de destino vía autocompletar ──────────────
+    # 1. Click en el dnt-select para abrir y enfocar el input interno.
+    # 2. page.keyboard.type() escribe con eventos reales, lo que dispara
+    #    la búsqueda XHR y carga las dnt-option.
+    # 3. Click en la opción cuyo texto empieza por el DIR3.
+    dest_select = page.locator("dnt-select#destinationOrganism")
+    await dest_select.scroll_into_view_if_needed()
+    # El <dnt-select> es un wrapper plano (~21 px); el <input> combobox
+    # real vive dentro del shadow de su <dnt-input>, ~36 px más abajo.
+    # Clicar el host no foca el input → page.keyboard.type cae en body
+    # y NUNCA se dispara el XHR /dir3/search. Hay que clicar el input
+    # real con coordenadas reales para que reciba foco.
+    input_coords = await page.evaluate(
+        """() => {
+          const ds = document.querySelector('dnt-select#destinationOrganism');
+          const dntInput = ds?.shadowRoot?.querySelector('dnt-input[role="combobox"]');
+          const real = dntInput?.shadowRoot?.querySelector('input.dnt-input__inner');
+          if (!real) return null;
+          const r = real.getBoundingClientRect();
+          return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+        }"""
+    )
+    if not input_coords:
+        raise RuntimeError("destination_combobox_input_not_found")
+    await page.mouse.click(input_coords["x"], input_coords["y"])
+    await page.keyboard.type(unit_dir3, delay=80)
+    # Esperar a que la opción aparezca y clicarla en una sola operación
+    # atómica — el CDK overlay re-pinta la lista varias veces durante el
+    # XHR de búsqueda, así que entre `wait_for_function` y el click puede
+    # cambiar el DOM. El JS hace polling interno (timeout 15 s).
+    pick_result = await page.evaluate(_PICK_DESTINATION_JS, {"dir3": unit_dir3, "timeoutMs": 15_000})
+    status = (pick_result or {}).get("status")
+    if status == "ok":
+        console.print(f"[dim]REG paso 2: destino seleccionado → {pick_result.get('text')!r}[/]")
+    else:
+        opts = (pick_result or {}).get("options")
+        if status == "no_match" and opts is not None:
+            preview = ", ".join(opts[:5]) if opts else "(lista vacía)"
+            raise RuntimeError(
+                f"destination_pick_failed:no_match dir3={unit_dir3!r} options=[{preview}]"
+            )
+        raise RuntimeError(f"destination_pick_failed:{status or 'unknown'}")
 
     # ── Asunto, EXPONE, SOLICITA ───────────────────────────────────────
-    if request.get("title"):
-        await _mat_input_by_label(page, "Asunto", request["title"][:255])
-
-    expone = (request.get("expone") or "")[:4000]
-    solicita = (request.get("solicita") or "")[:4000]
-    if expone:
-        await _mat_input_by_label(page, "Expone", expone)
-    if solicita:
-        await _mat_input_by_label(page, "Solicita", solicita)
+    # Límites reales de REG: asunto 80 chars, expone/solicita 4000.
+    payload = {
+        "subject": (request.get("title") or "")[:80],
+        "exposes": (request.get("expone") or "")[:4000],
+        "solicit": (request.get("solicita") or "")[:4000],
+    }
+    failures = await page.evaluate(_FILL_STEP2_TEXTS_JS, payload)
+    if failures:
+        console.print(f"[yellow]REG paso 2: campos no rellenados: {failures}[/]")
 
 
 async def _step3_documentacion(page, pdf_path: Path, console) -> None:
@@ -331,38 +528,71 @@ async def _step3_documentacion(page, pdf_path: Path, console) -> None:
     await page.wait_for_timeout(1_500)
 
 
-async def _step4_firma_y_justificante(
+async def _step4_firma(
     page,
     context,
-    work_dir: Path,
     console,
-) -> tuple[Optional[str], Optional[Path]]:
-    """Firma con Cl@ve y captura el REGAGE + justificante PDF.
+) -> tuple[Optional[str], Optional[str]]:
+    """Firma con Cl@ve y devuelve ``(REGAGE, registry_uuid)``.
 
-    El paso 4 dispara la pasarela de firma de Cl@ve (componente AutoFirma
-    o redirección a `pasarela-ident.clave.gob.es`). Si el certificado
-    FNMT está pre-cargado en el perfil de Firefox, el bounce es silencioso.
-    Al volver, REG muestra la página de confirmación con el número
-    REGAGE… y un botón "Descargar justificante".
+    Pasos: (1) marcar el checkbox ``checkTerms``; (2) pulsar
+    "Firmar y registrar (Cl@ve)" — un ``dnt-split-button`` cuyo botón
+    principal lanza la pasarela Cl@ve. Si el certificado FNMT está
+    pre-cargado en el perfil de Firefox, el bounce es silencioso y al
+    volver REG nos deja en ``/es/detalle-registro/{uuid}``.
+
+    El justificante NO se descarga desde la UI: el botón "Descargar
+    justificante" apunta a una URL que tarda unos segundos en estar
+    viva y, mientras tanto, abre un popup "La URL solicitada no
+    existe". Sacamos el UUID del registro de la URL y descargamos por
+    API directa (``reg-api.redsara.es/documents/uuid/…``) más tarde,
+    fuera del flujo del browser.
     """
-    await _click_button(page, "Firmar")
+    # Marcar checkbox de confirmación antes de firmar (si no, el botón
+    # de firmar queda deshabilitado).
+    await page.evaluate(
+        "() => { const cb = document.querySelector('dnt-checkbox[formcontrolname=\"checkTerms\"]'); "
+        "const inner = cb?.shadowRoot?.querySelector('input[type=\"checkbox\"]'); "
+        "if (inner && !inner.checked) (inner || cb).click(); }"
+    )
 
-    # Esperamos a que (a) salgamos del paso 4 o (b) volvamos del bounce
-    # de Cl@ve. El timeout es generoso porque la firma puede tardar.
+    # Pulsar la parte principal del split-button (Cl@ve es la opción por
+    # defecto). El chevron de la derecha abriría el dropdown con
+    # "Firmar con certificado electrónico" — la diferenciamos por clase.
+    clicked = await page.evaluate(
+        "() => { const sb = document.querySelector('dnt-split-button'); "
+        "const main = sb?.shadowRoot?.querySelector('.dnt-split-button__main-button'); "
+        "if (!main) return false; main.click(); return true; }"
+    )
+    if not clicked:
+        raise RuntimeError("firmar_button_not_found")
+
+    # Esperamos a que (a) entremos en la pasarela Cl@ve o (b) lleguemos
+    # ya a la página de detalle del registro. El timeout es generoso
+    # porque la firma puede tardar mientras se elige el certificado.
     try:
         await page.wait_for_url(
-            lambda url: ("clave.gob.es" in url) or ("/nuevo-registro" not in url and "/confirmacion" in url) or _regage_in_url(url),
+            lambda url: (
+                "clave.gob.es" in url
+                or "/detalle-registro/" in url
+                or _regage_in_url(url)
+            ),
             timeout=180_000,
         )
     except Exception as e:
         raise RuntimeError(f"firma_no_progreso: {page.url}") from e
 
     if "clave.gob.es" in page.url:
-        console.print("[dim]REG: pasarela Cl@ve detectada para firma[/]")
+        console.print("[dim]REG: pasarela Cl@ve detectada — eligiendo DNIe/Certificado[/]")
+        # Preferimos siempre certificado electrónico (FNMT pre-cargado en
+        # el perfil Firefox); si no, caemos a otros métodos disponibles.
         for sel in (
-            'button[onclick*="AFIRMA"]', 'button[onclick*="afirma"]',
-            'a[href*="AFIRMA"]', 'button:has-text("DNIe")',
+            'button:has-text("Acceso DNIe / Certificado electrónico")',
+            'a:has-text("Acceso DNIe / Certificado electrónico")',
             'button:has-text("Certificado electrónico")',
+            'button:has-text("DNIe")',
+            'button[onclick*="AFIRMA"]', 'button[onclick*="afirma"]',
+            'a[href*="AFIRMA"]',
         ):
             try:
                 btn = page.locator(sel).first
@@ -373,7 +603,7 @@ async def _step4_firma_y_justificante(
             except Exception:
                 continue
         try:
-            await page.wait_for_url("**reg.redsara.es/**", timeout=180_000)
+            await page.wait_for_url("**reg.redsara.es/es/detalle-registro/**", timeout=180_000)
         except Exception as e:
             from auth.session_manager import SessionExpiredError
             raise SessionExpiredError(
@@ -396,81 +626,80 @@ async def _step4_firma_y_justificante(
         if m:
             registry_number = m.group(0)
 
-    # Descarga del justificante. REG suele ofrecer un botón "Descargar
-    # justificante" que devuelve un PDF base64 (mismo endpoint API que el
-    # scraper). Por simplicidad usamos el flujo nativo de Playwright.
-    justificante_path: Optional[Path] = None
-    try:
-        async with page.expect_download(timeout=30_000) as download_info:
-            await page.get_by_role("button", name=re.compile("Descargar justificante|Justificante", re.I)).first.click()
-        download = await download_info.value
-        target = work_dir / f"justificante_{registry_number or 'reg'}.pdf"
-        await download.save_as(target)
-        justificante_path = target
-        console.print(f"[dim]→ Justificante: {target} ({target.stat().st_size} bytes)[/]")
-    except Exception as e:
-        console.print(f"[yellow]REG: no se pudo descargar justificante automáticamente ({e})[/]")
-
-    return registry_number, justificante_path
-
-
-# ─────────────────────────────────────────────────────────────────────────
-# Webhook upload
-# ─────────────────────────────────────────────────────────────────────────
-
-
-async def _upload_justificante(
-    client,
-    *,
-    access_request_id: str,
-    registry_number: Optional[str],
-    pdf_path: Path,
-    destination_name: str,
-    subject: str,
-) -> dict:
-    import base64
-    import hashlib
-
-    import httpx
-
-    content = pdf_path.read_bytes()
-    payload = {
-        "source": "redsara_rec",
-        "expedienteRef": registry_number or "",
-        "documents": [
-            {
-                "filename": f"Justificante - {registry_number or 'REG'}.pdf",
-                "contentType": "application/pdf",
-                "content": base64.b64encode(content).decode("ascii"),
-                "contentHash": hashlib.sha256(content).hexdigest(),
-            }
-        ],
-        "metadata": {
-            "access_request_id": access_request_id,
-            "registryNumber": registry_number,
-            "destinyOrganism": destination_name,
-            "subject": subject,
-        },
-    }
-
-    async with httpx.AsyncClient(timeout=120) as http:
-        r = await http.post(
-            client._webhook_url,
-            json=payload,
-            headers={**client._auth_headers, "Content-Type": "application/json"},
+    # UUID del registro: la URL tras la firma es
+    # https://reg.redsara.es/es/detalle-registro/{uuid}[/...]
+    registry_uuid: Optional[str] = None
+    m = re.search(r"/detalle-registro/([0-9a-f-]{36})", page.url, re.IGNORECASE)
+    if m:
+        registry_uuid = m.group(1)
+    else:
+        console.print(
+            f"[yellow]REG: no se pudo extraer registry_uuid de la URL ({page.url})[/]"
         )
-        r.raise_for_status()
-        return r.json()
+
+    return registry_number, registry_uuid
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# DOM helpers — REG uses Angular Material (mat-* components)
+# Justificante download (API directa, sin UI)
+# ─────────────────────────────────────────────────────────────────────────
+
+
+async def _download_justificante_via_api(
+    session_manager,
+    registry_uuid: str,
+    registry_number: Optional[str],
+    work_dir: Path,
+    console,
+) -> Optional[Path]:
+    """Descarga el justificante por la API REST de Red SARA.
+
+    Reusa ``RedSaraRecScraper.download_justificante`` (el mismo método
+    que el sync de fondo). Reintenta si el documento aún no está
+    indexado tras la firma — el backend SARA puede tardar varios
+    segundos en exponer el PDF en /documents/uuid/{doc_uuid}.
+    """
+    from portals.redsara_rec import RedSaraRecScraper
+
+    scraper = RedSaraRecScraper(session_manager)
+    target = work_dir / f"justificante_{registry_number or 'reg'}.pdf"
+
+    # 6 intentos × backoff 3/5/8/13/21/34 s ≈ 84 s totales
+    delays = [3, 5, 8, 13, 21, 34]
+    last_err: Optional[str] = None
+    for attempt, delay in enumerate(delays, start=1):
+        try:
+            ok = await scraper.download_justificante(registry_uuid, target)
+            if ok and target.exists() and target.stat().st_size > 0:
+                console.print(
+                    f"[dim]→ Justificante: {target} ({target.stat().st_size} bytes)[/]"
+                )
+                await scraper.close()
+                return target
+        except Exception as e:
+            last_err = str(e)
+        console.print(
+            f"[yellow]REG: justificante aún no disponible (intento {attempt}/{len(delays)}), reintento en {delay}s[/]"
+        )
+        await asyncio.sleep(delay)
+
+    await scraper.close()
+    console.print(
+        f"[bold yellow]REG: no se pudo descargar justificante tras {len(delays)} intentos"
+        + (f" — último error: {last_err}" if last_err else "")
+        + "[/]"
+    )
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# DOM helpers — REG usa custom elements DNT (dnt-input, dnt-select, …)
 # ─────────────────────────────────────────────────────────────────────────
 
 
 async def _wait_wizard_ready(page) -> None:
-    """Espera a que el SPA Angular del REG haya pintado el primer mat-form-field."""
-    await page.wait_for_selector("mat-form-field, mat-radio-group", timeout=30_000)
+    """Espera a que el SPA Angular pinte el primer ``dnt-input`` o ``dnt-radio-group``."""
+    await page.wait_for_selector("dnt-input, dnt-radio-group", timeout=30_000)
 
 
 async def _wait_step_active(page, step: int) -> None:
@@ -480,69 +709,35 @@ async def _wait_step_active(page, step: int) -> None:
     try:
         await page.locator(f"text={needle.pattern}").first.wait_for(state="visible", timeout=20_000)
     except Exception:
-        # No siempre el texto está visible; en ese caso confiamos en que
-        # tras el Siguiente anterior el DOM se ha renovado lo bastante
-        # como para tener nuevos mat-form-field.
+        # Si el texto no está visible, esperamos a que el DOM se renueve.
         await page.wait_for_timeout(800)
 
 
 async def _click_button(page, label: str) -> None:
-    """Pulsa el botón con el texto indicado (case-insensitive). Usa el
-    primer botón visible que coincide."""
+    """Pulsa el ``dnt-button`` (o ``<button>``) cuyo texto coincide.
+
+    REG envuelve los botones de navegación en custom elements, así que
+    ``page.get_by_role('button')`` no siempre los encuentra. Buscamos
+    primero entre los ``dnt-button`` (light DOM) y, si no, caemos al
+    selector estándar.
+    """
+    clicked = await page.evaluate(
+        "(label) => { const norm = s => (s || '').trim().toLowerCase(); "
+        "const target = norm(label); "
+        "const visible = el => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; }; "
+        "const btn = Array.from(document.querySelectorAll('dnt-button')) "
+        "  .find(b => visible(b) && norm(b.textContent) === target); "
+        "if (btn) { btn.click(); return true; } "
+        "return false; }",
+        label,
+    )
+    if clicked:
+        return
     pattern = re.compile(re.escape(label), re.I)
     try:
         await page.get_by_role("button", name=pattern).first.click(timeout=10_000)
     except Exception:
-        # Fallback: locator por texto.
         await page.locator(f"button:has-text('{label}')").first.click(timeout=10_000)
-
-
-async def _click_radio_by_label(page, label: str) -> None:
-    """Tilda un mat-radio-button por el texto visible."""
-    pattern = re.compile(re.escape(label), re.I)
-    try:
-        await page.get_by_role("radio", name=pattern).first.check(timeout=5_000)
-    except Exception:
-        # Fallback: click directo sobre el contenedor.
-        node = page.locator(f"mat-radio-button:has-text('{label}')").first
-        await node.click(timeout=5_000)
-
-
-async def _mat_input_by_label(page, label: str, value: str) -> None:
-    """Rellena el input/textarea de un ``mat-form-field`` localizado por su label."""
-    pattern = re.compile(re.escape(label), re.I)
-    locator = page.get_by_label(pattern)
-    await locator.first.fill(value, timeout=10_000)
-
-
-async def _mat_select_by_label(page, label: str, value: str) -> None:
-    """Abre un mat-select por su label y elige la opción exacta (texto)."""
-    pattern = re.compile(re.escape(label), re.I)
-    try:
-        await page.get_by_label(pattern).first.click(timeout=5_000)
-        await page.get_by_role("option", name=re.compile(rf"^{re.escape(value)}$", re.I)).first.click(timeout=5_000)
-    except Exception:
-        # Fallback más laxo por inclusión de texto.
-        await _mat_select_contains(page, label, value)
-
-
-async def _mat_select_contains(page, label: str, needle: str) -> None:
-    """Variante de ``_mat_select_by_label`` que admite coincidencias parciales."""
-    pattern = re.compile(re.escape(label), re.I)
-    await page.get_by_label(pattern).first.click(timeout=5_000)
-    await page.get_by_role("option", name=re.compile(re.escape(needle), re.I)).first.click(timeout=8_000)
-
-
-async def _check_checkboxes_matching(page, label_substrings: list[str]) -> None:
-    """Marca todos los mat-checkbox cuyo label contenga alguno de los substrings."""
-    for substr in label_substrings:
-        pattern = re.compile(re.escape(substr), re.I)
-        for box in await page.get_by_role("checkbox", name=pattern).all():
-            try:
-                if not await box.is_checked():
-                    await box.check(timeout=2_000)
-            except Exception:
-                continue
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -551,9 +746,8 @@ async def _check_checkboxes_matching(page, label_substrings: list[str]) -> None:
 
 
 def _is_headed_debug(settings) -> bool:
-    """Replica la condición que ``submit_request_transparencia`` usa para
-    permitir abrir Firefox visible cuando ``HEADLESS_DISABLED=true``."""
-    return bool(getattr(settings, "headless_disabled", False)) or os.environ.get("HEADLESS_DISABLED") == "true"
+    from storage.preferences import is_headless_disabled
+    return is_headless_disabled(settings)
 
 
 def _utcnow_iso() -> str:

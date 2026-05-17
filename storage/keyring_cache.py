@@ -18,8 +18,11 @@ existing call sites work unchanged.
 from __future__ import annotations
 
 import keyring as _real_keyring
+import logging
 import threading
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 # Re-export the errors submodule so callers that do
 # `keyring.errors.PasswordDeleteError` keep working.
@@ -43,7 +46,20 @@ def get_password(service: str, username: str) -> str | None:
 
 
 def set_password(service: str, username: str, password: str) -> None:
-    _real_keyring.set_password(service, username, password)
+    # macOS error -25244 (errSecMissingEntitlement) — when a stale Keychain
+    # item carries an ACL bound to a previous Python binary signature, the
+    # current binary can read it (with prompts) but can't overwrite it. We
+    # don't want that to crash the pipeline: keep the value in the process
+    # cache so the rest of this run keeps working, and surface a warning so
+    # the user can clear the stale item with `security delete-generic-password`.
+    try:
+        _real_keyring.set_password(service, username, password)
+    except _real_keyring.errors.KeyringError as e:
+        logger.warning(
+            "Keychain write failed for %s/%s (%s) — using in-memory cache for this run. "
+            "Run: security delete-generic-password -s %s -a %s",
+            service, username, e, service, username,
+        )
     with _lock:
         _cache[(service, username)] = password
 

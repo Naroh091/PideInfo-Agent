@@ -546,54 +546,57 @@ async def _sync_consejo_expedientes(
                         )
                     continue
 
-                docs_and_paths: list[tuple[DocumentoCTBGExpediente, Path]] = []
-                downloaded_paths: list[Path] = []
+                # Download all new docs of the expediente, then upload as one
+                # batch so the backend can promote ``externalId`` via hash on
+                # our solicitud and resolve the Consejo-generated phases in
+                # the same request (otherwise non-original docs land before
+                # the promotion and force a second crawl to retry them).
+                batch: list[tuple[DocumentoCTBGExpediente, Path]] = []
                 for d in new_docs:
                     safe_csv = d.csv or f"unknown-{abs(hash(d.title)) & 0xFFFFFF:06x}"
                     dest = downloads.downloads_dir / f"ctbg_{exp.numero.replace('/', '-')}_{safe_csv}.pdf"
                     try:
                         console.print(f"[dim]CTBG descargando [{d.phase}] {d.title}...[/]")
                         await scraper.download(d, dest)
-                        docs_and_paths.append((d, dest))
-                        downloaded_paths.append(dest)
+                        batch.append((d, dest))
                     except Exception as e:
                         console.print(
                             f"[red]CTBG: error descargando {d.title}: {e}[/]"
                         )
 
-                if not docs_and_paths:
-                    save_state(state, settings.state_file)
+                if not batch:
                     continue
 
                 try:
-                    result = await pideinfo.sync_consejo_expediente_documents(exp, docs_and_paths)
-                    created = result.get("created") or []
-                    skipped = result.get("skipped") or []
-
-                    for item in created:
-                        csv = item.get("csv")
-                        if csv:
-                            state.ctbg_synced_csvs.add(csv)
-                    # Non-retryable skip codes: backend already decided we
-                    # shouldn't keep sending these. Retryable codes
-                    # (e.g. complaint_not_found) stay out of the set so the
-                    # next run reuploads once the complaint exists.
-                    non_retryable = {"duplicate_hash", "unsupported_type", "decode_error", "tiny_image"}
-                    for item in skipped:
-                        if item.get("code") in non_retryable:
-                            csv = item.get("csv")
-                            if csv:
-                                state.ctbg_synced_csvs.add(csv)
-                    synced += len(created)
+                    result = await pideinfo.sync_consejo_expediente_documents(batch, exp)
+                    skipped_items = result.get("skipped") or []
+                    # Legacy backends won't echo per-doc ``csv``: degrade to
+                    # the old "persist everything" behavior so the new payload
+                    # shape doesn't regress until the backend ships per-doc
+                    # gating + hash reconciliation.
+                    has_per_doc_csv = any("csv" in s for s in skipped_items)
+                    retryable_csvs: set[str] = (
+                        {s["csv"] for s in skipped_items if s.get("retryable") and s.get("csv")}
+                        if has_per_doc_csv else set()
+                    )
+                    for d, _path in batch:
+                        if d.csv and d.csv not in retryable_csvs:
+                            state.ctbg_synced_csvs.add(d.csv)
+                    created = result.get("created")
+                    if isinstance(created, list):
+                        synced += len(created)
+                    elif isinstance(created, int):
+                        synced += created
                 except Exception as e:
                     console.print(
-                        f"[red]CTBG {exp.numero}: error enviando batch: {e}[/]"
+                        f"[red]CTBG: error subiendo lote de {exp.numero}: {e}[/]"
                     )
                 finally:
-                    for p in downloaded_paths:
-                        downloads.cleanup_file(p)
-                    # Persist after each expediente — survives a crash mid-crawl.
-                    save_state(state, settings.state_file)
+                    for _d, path in batch:
+                        downloads.cleanup_file(path)
+
+                # Persist after each expediente — survives a crash mid-crawl.
+                save_state(state, settings.state_file)
     except Exception as e:
         console.print(f"[red]CTBG expedientes: error inesperado: {e}[/]")
 

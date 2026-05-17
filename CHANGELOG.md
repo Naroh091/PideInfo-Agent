@@ -1,5 +1,50 @@
 # Changelog
 
+## [0.6.3](https://github.com/Naroh091/PideInfo-Agent/compare/v0.6.2...v0.6.3) (2026-05-16)
+
+
+### Bug Fixes
+
+* download confirmation after REG process ([768bf04](https://github.com/Naroh091/PideInfo-Agent/commit/768bf047e5fbd6d973afbbf2606898113d5c6a7f))
+* REG justificante download retries when SARA returns "URL no existe" ([e997604](https://github.com/Naroh091/PideInfo-Agent/commit/e997604457a159ba21293bad270a0de2b9745f6d))
+* REG justificante downloads via API instead of UI popup-prone button ([0e697ff](https://github.com/Naroh091/PideInfo-Agent/commit/0e697ffb4e0afcfc670740544870328b84387415))
+
+## [0.6.2](https://github.com/Naroh091/PideInfo-Agent/compare/v0.6.1...v0.6.2) (2026-05-16)
+
+
+### Bug Fixes
+
+* REG justificante upload uses canonical client method ([47be977](https://github.com/Naroh091/PideInfo-Agent/commit/47be9778c3b17d46b2df7d7b4c76108933f956e7))
+* REG justificante upload uses canonical client method ([55211ac](https://github.com/Naroh091/PideInfo-Agent/commit/55211ac75167400f9494ca73a11e9a3c53839151))
+
+## [0.6.1](https://github.com/Naroh091/PideInfo-Agent/compare/v0.6.0...v0.6.1) (2026-05-16)
+
+
+### Bug Fixes
+
+* REG destination picker focuses real combobox input ([3e4885e](https://github.com/Naroh091/PideInfo-Agent/commit/3e4885e253d4bfbf65857582ce60728146ee2c06))
+* REG destination picker focuses real combobox input ([d1bd45e](https://github.com/Naroh091/PideInfo-Agent/commit/d1bd45ebea83954d5df77ccba29cab96d9b9a4bf))
+
+## [0.6.0](https://github.com/Naroh091/PideInfo-Agent/compare/v0.5.0...v0.6.0) (2026-05-15)
+
+
+### Features
+
+* REG ([6522d39](https://github.com/Naroh091/PideInfo-Agent/commit/6522d39f4ab729283692979b7045a672c0ac834a))
+* REG ([885b17a](https://github.com/Naroh091/PideInfo-Agent/commit/885b17a93d55b2715e061d5ff0333591a1160ca5))
+
+
+### Bug Fixes
+
+* reg implementation ([e848b55](https://github.com/Naroh091/PideInfo-Agent/commit/e848b55c5c5384206b9e62ac89296c3dbdea871c))
+
+## [0.5.0](https://github.com/Naroh091/PideInfo-Agent/compare/v0.4.0...v0.5.0) (2026-05-11)
+
+
+### Features
+
+* **ctbg:** derive complaint branch/reason from resolution_result ([212a30d](https://github.com/Naroh091/PideInfo-Agent/commit/212a30de1b6d2a4e24306b07e1059ba7830f2462))
+
 ## [0.4.0](https://github.com/Naroh091/PideInfo-Agent/compare/v0.3.1...v0.4.0) (2026-05-04)
 
 

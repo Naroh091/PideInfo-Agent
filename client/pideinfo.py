@@ -544,27 +544,38 @@ class PideInfoClient:
 
     async def sync_consejo_expediente_documents(
         self,
+        docs: list[tuple[DocumentoCTBGExpediente, Path]],
         expediente: ExpedienteCTBG,
-        docs_and_paths: list[tuple[DocumentoCTBGExpediente, Path]],
     ) -> dict:
-        """Send every new document of a CTBG expediente in one webhook call.
+        """Send all new docs of one CTBG expediente in a single batch.
 
-        ``expedienteRef`` is ``expediente.numero`` (e.g. ``"1378/2026"``); the
-        backend matches it against ``AccessRequestComplaint.externalId`` and,
-        if there is no match, falls back to hashing each doc to locate the
-        originating complaint (typically via the signed instancia / recibo
-        that the agent uploaded at submission time) and promotes the
-        complaint's externalId to the new ref.
+        Atomicity matters: only the original solicitud (uploaded at filing
+        time via ``upload_filed_complaint_documents``) carries a
+        ``contentHash`` the backend can use to reconcile a freshly-opened
+        expediente with an existing ``AccessRequestComplaint``. Sending the
+        whole expediente as one request lets the backend defer non-matching
+        docs and replay them after the hash match promotes ``externalId`` —
+        avoiding a second crawl just to land the Consejo-generated phases
+        (acuse, oficios, resolución…).
 
-        Documents whose title looks like the user's original submission
-        (SOLICITUD / RECIBO / INSTANCIA) are sorted to the front of the batch
-        so the backend's hash fallback resolves the complaint on doc #1 and
-        the rest of the batch reuses the resolved complaint.
+        Hash-matchable submission docs (titles starting with SOLICITUD /
+        RECIBO / INSTANCIA) are sorted to the front of the batch so the
+        backend's hash fallback resolves the complaint on doc #1 and the
+        remaining Consejo-generated docs land against the resolved complaint
+        in the same pass.
+
+        Per-doc fields (``complaint_phase``, ``csv``, ``documentTitle``)
+        travel in each document's ``metadata`` block; expediente-level fields
+        stay at the top level.
         """
-        # Hash-matchable submission docs first; everything else keeps the
-        # scraper's natural (chronological) order.
+        if not docs:
+            return {"created": [], "skipped": []}
+
+        # Hash-matchable submission docs first; the scraper's natural
+        # (chronological) order is preserved as the tiebreaker by sorted's
+        # stability.
         sorted_docs = sorted(
-            docs_and_paths,
+            docs,
             key=lambda dp: (
                 0
                 if dp[0].title.lower().startswith(("recibo", "solicitud", "instancia"))
@@ -573,9 +584,10 @@ class PideInfoClient:
         )
 
         invalid: list[str] = []
-        documents_payload = []
+        documents_payload: list[dict] = []
         for doc, path in sorted_docs:
             suffix = path.suffix or ".pdf"
+            # Avoid path separators in titles (e.g. "Resolución expte. 501/2026").
             safe_title = doc.title.replace("/", "-")
             filename = f"{safe_title}{suffix}"
             if not _is_valid_pdf(path):
@@ -610,7 +622,7 @@ class PideInfoClient:
             },
         }
 
-        async with httpx.AsyncClient(timeout=120) as client:
+        async with httpx.AsyncClient(timeout=300) as client:
             response = await client.post(
                 self._webhook_url,
                 json=payload,
@@ -622,16 +634,19 @@ class PideInfoClient:
             response.raise_for_status()
             result = response.json()
 
-        created = result.get("created") or []
-        skipped = result.get("skipped") or []
-
-        if created:
+        created = result.get("created")
+        if isinstance(created, list):
+            for item in created:
+                console.print(f"[green]CTBG: {item.get('filename', '?')} → PideInfo[/]")
+        elif isinstance(created, int) and created > 0:
             console.print(
-                f"[green]CTBG {expediente.numero}: {len(created)} doc(s) → PideInfo[/]"
+                f"[green]CTBG {expediente.numero}: {created} doc(s) → PideInfo[/]"
             )
-        for s in skipped:
+        for s in result.get("skipped") or []:
+            retry_hint = " [reintentable]" if s.get("retryable") else ""
+            reason = s.get("reason") or s.get("code") or "?"
             console.print(
-                f"[dim]CTBG saltado: {s.get('filename', '?')} ({s.get('reason', s.get('code', '?'))})[/]"
+                f"[dim]CTBG saltado: {s.get('filename', '?')} ({reason}){retry_hint}[/]"
             )
         return result
 
