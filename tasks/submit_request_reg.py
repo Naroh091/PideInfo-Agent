@@ -210,7 +210,11 @@ async def _drive(
             app_user="REG",
         )
         try:
-            upload_summary = await client.sync_redsara_document(registro, justificante_path)
+            upload_summary = await client.sync_redsara_document(
+                registro,
+                justificante_path,
+                access_request_id=payload["access_request_id"],
+            )
         except Exception as e:
             logger.exception("upload of justificante failed")
             console.print(
