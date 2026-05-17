@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.0](https://github.com/Naroh091/PideInfo-Agent/compare/v0.6.3...v0.7.0) (2026-05-17)
+
+
+### Features
+
+* implement full records ([27b5e5e](https://github.com/Naroh091/PideInfo-Agent/commit/27b5e5e609653e82a4d771082db7970cfe9f5648))
+
 ## [0.6.3](https://github.com/Naroh091/PideInfo-Agent/compare/v0.6.2...v0.6.3) (2026-05-16)
 
 
