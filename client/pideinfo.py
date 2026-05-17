@@ -542,49 +542,67 @@ class PideInfoClient:
             console.print(f"[yellow]Saltado: {skipped['filename']} ({skipped['reason']})[/]")
         return result
 
-    async def sync_consejo_expediente_document(
+    async def sync_consejo_expediente_documents(
         self,
-        doc: DocumentoCTBGExpediente,
-        path: Path,
         expediente: ExpedienteCTBG,
+        docs_and_paths: list[tuple[DocumentoCTBGExpediente, Path]],
     ) -> dict:
-        """Send a CTBG expediente document (any phase) to PideInfo.
+        """Send every new document of a CTBG expediente in one webhook call.
 
-        ``expedienteRef`` is the complaint number (e.g. ``"590/2026"``); the
-        backend's ``findByExternalId`` matches it against
-        ``AccessRequestComplaint.externalId``.
+        ``expedienteRef`` is ``expediente.numero`` (e.g. ``"1378/2026"``); the
+        backend matches it against ``AccessRequestComplaint.externalId`` and,
+        if there is no match, falls back to hashing each doc to locate the
+        originating complaint (typically via the signed instancia / recibo
+        that the agent uploaded at submission time) and promotes the
+        complaint's externalId to the new ref.
 
-        ``metadata.complaint_phase`` lets the backend pre-assign a complaint
-        ``DocumentType`` deterministically so the doc lands in the
-        "Documentos de reclamación" section before the AI re-classifies it.
+        Documents whose title looks like the user's original submission
+        (SOLICITUD / RECIBO / INSTANCIA) are sorted to the front of the batch
+        so the backend's hash fallback resolves the complaint on doc #1 and
+        the rest of the batch reuses the resolved complaint.
         """
-        suffix = path.suffix or ".pdf"
-        # Avoid path separators in titles (e.g. "Resolución expte. 501/2026").
-        safe_title = doc.title.replace("/", "-")
-        filename = f"{safe_title}{suffix}"
-        if not _is_valid_pdf(path):
-            _refuse_invalid_pdf([filename], source=f"CTBG expediente {expediente.numero}")
+        # Hash-matchable submission docs first; everything else keeps the
+        # scraper's natural (chronological) order.
+        sorted_docs = sorted(
+            docs_and_paths,
+            key=lambda dp: (
+                0
+                if dp[0].title.lower().startswith(("recibo", "solicitud", "instancia"))
+                else 1
+            ),
+        )
 
-        content = path.read_bytes()
-        content_hash = hashlib.sha256(content).hexdigest()
-        content_b64 = base64.b64encode(content).decode("ascii")
+        invalid: list[str] = []
+        documents_payload = []
+        for doc, path in sorted_docs:
+            suffix = path.suffix or ".pdf"
+            safe_title = doc.title.replace("/", "-")
+            filename = f"{safe_title}{suffix}"
+            if not _is_valid_pdf(path):
+                invalid.append(filename)
+                continue
+            content = path.read_bytes()
+            documents_payload.append({
+                "filename": filename,
+                "contentType": self._guess_mime(path),
+                "content": base64.b64encode(content).decode("ascii"),
+                "contentHash": hashlib.sha256(content).hexdigest(),
+                "portalDate": expediente.fecha_apertura,
+                "metadata": {
+                    "complaint_phase": doc.phase,
+                    "csv": doc.csv,
+                    "documentTitle": doc.title,
+                },
+            })
+
+        if invalid:
+            _refuse_invalid_pdf(invalid, source=f"CTBG expediente {expediente.numero}")
 
         payload = {
             "source": "consejo_ctbg",
-            "expedienteRef": doc.expediente_ref,
-            "documents": [
-                {
-                    "filename": filename,
-                    "contentType": self._guess_mime(path),
-                    "content": content_b64,
-                    "contentHash": content_hash,
-                    "portalDate": expediente.fecha_apertura,
-                }
-            ],
+            "expedienteRef": expediente.numero,
+            "documents": documents_payload,
             "metadata": {
-                "complaint_phase": doc.phase,
-                "csv": doc.csv,
-                "documentTitle": doc.title,
                 "expedienteEstado": expediente.estado,
                 "expedienteTitulo": expediente.titulo,
                 "fechaApertura": expediente.fecha_apertura,
@@ -604,11 +622,16 @@ class PideInfoClient:
             response.raise_for_status()
             result = response.json()
 
-        if result.get("created", 0) > 0:
-            console.print(f"[green]CTBG: {filename} → PideInfo[/]")
-        for skipped in result.get("skipped", []):
+        created = result.get("created") or []
+        skipped = result.get("skipped") or []
+
+        if created:
             console.print(
-                f"[dim]CTBG saltado: {skipped['filename']} ({skipped['reason']})[/]"
+                f"[green]CTBG {expediente.numero}: {len(created)} doc(s) → PideInfo[/]"
+            )
+        for s in skipped:
+            console.print(
+                f"[dim]CTBG saltado: {s.get('filename', '?')} ({s.get('reason', s.get('code', '?'))})[/]"
             )
         return result
 

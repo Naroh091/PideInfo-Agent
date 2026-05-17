@@ -22,6 +22,7 @@ from rich.table import Table
 from auth.session_manager import SessionManager, SessionExpiredError
 from client.pideinfo import PideInfoClient
 from config import Settings
+from models.consejo_expediente import DocumentoCTBGExpediente
 from models.portal import Notificacion
 from notifier.desktop import (
     notify_auth_required,
@@ -545,22 +546,54 @@ async def _sync_consejo_expedientes(
                         )
                     continue
 
+                docs_and_paths: list[tuple[DocumentoCTBGExpediente, Path]] = []
+                downloaded_paths: list[Path] = []
                 for d in new_docs:
                     safe_csv = d.csv or f"unknown-{abs(hash(d.title)) & 0xFFFFFF:06x}"
                     dest = downloads.downloads_dir / f"ctbg_{exp.numero.replace('/', '-')}_{safe_csv}.pdf"
                     try:
                         console.print(f"[dim]CTBG descargando [{d.phase}] {d.title}...[/]")
                         await scraper.download(d, dest)
-                        result = await pideinfo.sync_consejo_expediente_document(d, dest, exp)
-                        state.ctbg_synced_csvs.add(d.csv)
-                        synced += int(result.get("created", 0) or 0)
-                        downloads.cleanup_file(dest)
+                        docs_and_paths.append((d, dest))
+                        downloaded_paths.append(dest)
                     except Exception as e:
                         console.print(
                             f"[red]CTBG: error descargando {d.title}: {e}[/]"
                         )
-                # Persist after each expediente — survives a crash mid-crawl.
-                save_state(state, settings.state_file)
+
+                if not docs_and_paths:
+                    save_state(state, settings.state_file)
+                    continue
+
+                try:
+                    result = await pideinfo.sync_consejo_expediente_documents(exp, docs_and_paths)
+                    created = result.get("created") or []
+                    skipped = result.get("skipped") or []
+
+                    for item in created:
+                        csv = item.get("csv")
+                        if csv:
+                            state.ctbg_synced_csvs.add(csv)
+                    # Non-retryable skip codes: backend already decided we
+                    # shouldn't keep sending these. Retryable codes
+                    # (e.g. complaint_not_found) stay out of the set so the
+                    # next run reuploads once the complaint exists.
+                    non_retryable = {"duplicate_hash", "unsupported_type", "decode_error", "tiny_image"}
+                    for item in skipped:
+                        if item.get("code") in non_retryable:
+                            csv = item.get("csv")
+                            if csv:
+                                state.ctbg_synced_csvs.add(csv)
+                    synced += len(created)
+                except Exception as e:
+                    console.print(
+                        f"[red]CTBG {exp.numero}: error enviando batch: {e}[/]"
+                    )
+                finally:
+                    for p in downloaded_paths:
+                        downloads.cleanup_file(p)
+                    # Persist after each expediente — survives a crash mid-crawl.
+                    save_state(state, settings.state_file)
     except Exception as e:
         console.print(f"[red]CTBG expedientes: error inesperado: {e}[/]")
 
