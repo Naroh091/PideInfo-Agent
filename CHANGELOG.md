@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.4](https://github.com/Naroh091/PideInfo-Agent/compare/v0.7.3...v0.7.4) (2026-05-18)
+
+
+### Bug Fixes
+
+* fix default URI, pasting token ([2987d13](https://github.com/Naroh091/PideInfo-Agent/commit/2987d134139edf062bb4808be13a0f7e1a6cebb1))
+
 ## [0.7.3](https://github.com/Naroh091/PideInfo-Agent/compare/v0.7.2...v0.7.3) (2026-05-18)
 
 
