@@ -7,7 +7,8 @@ Drives Playwright through the REG / RED SARA wizard at
      teléfono + email, marcar avisos.
   2. Datos de solicitud      — buscar Unidad por DIR3, rellenar asunto,
      EXPONE y SOLICITA (cada uno ≤4000 caracteres).
-  3. Documentación           — adjuntar el PDF generado por PideInfo.
+  3. Documentación           — pantalla sin adjuntos; se avanza tal cual
+     (el cuerpo de la solicitud va en EXPONE/SOLICITA del paso 2).
   4. Firma de solicitud      — firmar con Cl@ve (certificado FNMT
      preinstalado en el perfil Firefox) y capturar el REGAGE.
 
@@ -116,17 +117,6 @@ async def _drive(
     )
     await session_manager.get_valid_session()
 
-    # Descarga el PDF de la solicitud que tendremos que adjuntar en el paso 3.
-    pdf_path = work_dir / "solicitud.pdf"
-    try:
-        pdf_bytes = client.download_pdf(
-            f"/solicitudes/nueva/realizar/redactar/{payload['access_request_id']}/descargar-pdf"
-        )
-        pdf_path.write_bytes(pdf_bytes)
-        console.print(f"[dim]Solicitud PDF descargada ({len(pdf_bytes)} bytes)[/]")
-    except Exception as e:
-        raise RuntimeError(f"could_not_download_request_pdf:{e}") from e
-
     async with lock_for("redsara"), async_playwright() as p:
         firefox_user_prefs = {
             "security.osclientcerts.autoload": True,
@@ -159,9 +149,11 @@ async def _drive(
             await _step2_solicitud(page, payload["destination"], payload["request"], console)
             await _click_button(page, "Siguiente")
 
-            client.progress_task(task_id, status="in_progress", note="Paso 3: Documentación")
+            # Paso 3 (Documentación): no adjuntamos nada — el contenido
+            # de la solicitud ya va en EXPONE/SOLICITA. Sólo esperamos a
+            # que se pinte el paso y pulsamos Siguiente.
+            client.progress_task(task_id, status="in_progress", note="Paso 3: Documentación (omitida)")
             await _wait_step_active(page, 3)
-            await _step3_documentacion(page, pdf_path, console)
             await _click_button(page, "Siguiente")
 
             client.progress_task(task_id, status="in_progress", note="Paso 4: Firma")
@@ -517,15 +509,6 @@ async def _step2_solicitud(page, destination: dict, request: dict, console) -> N
     failures = await page.evaluate(_FILL_STEP2_TEXTS_JS, payload)
     if failures:
         console.print(f"[yellow]REG paso 2: campos no rellenados: {failures}[/]")
-
-
-async def _step3_documentacion(page, pdf_path: Path, console) -> None:
-    """Adjunta el PDF de la solicitud en el paso 3."""
-    file_input = page.locator('input[type="file"]').first
-    await file_input.wait_for(state="attached", timeout=10_000)
-    await file_input.set_input_files(str(pdf_path))
-    # Espera a que la UI confirme la subida (típicamente aparece el nombre).
-    await page.wait_for_timeout(1_500)
 
 
 async def _step4_firma(
