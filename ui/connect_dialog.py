@@ -18,6 +18,33 @@ from typing import Callable, TypeVar
 _T = TypeVar("_T")
 
 
+def _attach_entry_context_menu(entry) -> None:
+    """Add a right-click Cortar/Copiar/Pegar menu to a Tk Entry widget.
+
+    ttk.Entry no trae menú contextual por defecto, así que tras introducir
+    el token con copy/paste el usuario no puede hacer clic derecho → Pegar.
+    Usamos los eventos virtuales nativos de Tk para que respeten la
+    selección, el portapapeles del SO y el masking de `show="*"`.
+    """
+    import tkinter as tk
+
+    menu = tk.Menu(entry, tearoff=0)
+    menu.add_command(label="Cortar", command=lambda: entry.event_generate("<<Cut>>"))
+    menu.add_command(label="Copiar", command=lambda: entry.event_generate("<<Copy>>"))
+    menu.add_command(label="Pegar", command=lambda: entry.event_generate("<<Paste>>"))
+
+    def _popup(event) -> None:
+        entry.focus_set()
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    # Button-3 = right click on Windows/Linux; Button-2 covers macOS-style mice.
+    entry.bind("<Button-3>", _popup)
+    entry.bind("<Button-2>", _popup)
+
+
 def _run_in_dedicated_thread(fn: Callable[[], _T]) -> _T:
     """Run a Tk dialog builder in its own thread and return its result.
 
@@ -122,6 +149,7 @@ def _show_connect_dialog_tk() -> "str | None":
     entry = ttk.Entry(frame, textvariable=token_var, width=60, show="*")
     entry.pack(fill="x", pady=(2, 0))
     entry.focus_set()
+    _attach_entry_context_menu(entry)
 
     error_var = tk.StringVar()
     ttk.Label(frame, textvariable=error_var, foreground="red", wraplength=460).pack(anchor="w", pady=(5, 0))
@@ -231,6 +259,7 @@ def _show_settings_dialog_tk(current_url: str) -> "str | None":
     url_var = tk.StringVar(value=current_url)
     entry = ttk.Entry(frame, textvariable=url_var, width=62)
     entry.pack(fill="x", pady=(2, 2))
+    _attach_entry_context_menu(entry)
     ttk.Label(
         frame,
         text="Deja vacío para usar el valor por defecto.",

@@ -21,8 +21,11 @@ class Settings(BaseSettings):
     portal_dehu: str = "https://dehu.redsara.es"
     portal_redsara: str = "https://reg.redsara.es"
 
-    # PideInfo
-    pideinfo_base_url: str = "http://localhost:8000"
+    # PideInfo. Default es producción: los binarios publicados no traen .env,
+    # por lo que el valor en código es el que ven los usuarios finales. Para
+    # desarrollo local, exportar PIDEINFO_BASE_URL=http://localhost:8000 o
+    # ponerlo en el .env (ver .env.example).
+    pideinfo_base_url: str = "https://pideinfo.es"
 
     # Agent
     auth_timeout_seconds: int = 120
