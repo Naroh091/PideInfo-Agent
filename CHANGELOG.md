@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.7.2](https://github.com/Naroh091/PideInfo-Agent/compare/v0.7.1...v0.7.2) (2026-05-18)
+
+
+### Bug Fixes
+
+* skip REG step 3 attachments — request body already in EXPONE/SOL… ([9124df2](https://github.com/Naroh091/PideInfo-Agent/commit/9124df2ca0cec1becd80c46ceb70f699ad13fb43))
+* skip REG step 3 attachments — request body already in EXPONE/SOLICITA ([dd6e114](https://github.com/Naroh091/PideInfo-Agent/commit/dd6e114739fd694be82ac8fd54f8361d6c78db79))
+
+## [0.7.1](https://github.com/Naroh091/PideInfo-Agent/compare/v0.7.0...v0.7.1) (2026-05-17)
+
+
+### Bug Fixes
+
+* handle request UUID when sending REG ([ac24b63](https://github.com/Naroh091/PideInfo-Agent/commit/ac24b63f14932de3e08a0c4354755d96b1c8a907))
+
 ## [0.7.0](https://github.com/Naroh091/PideInfo-Agent/compare/v0.6.3...v0.7.0) (2026-05-17)
 
 
