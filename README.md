@@ -287,6 +287,8 @@ Tipos de tarea soportados (`tasks/__init__.py`):
 
 Las tareas que llegaron mientras el agente estaba apagado se **drenan al arrancar** (`GET /api/agent/tasks/pending`) y, mientras corre, un job de APScheduler las pollea cada 60 s desde el tray.
 
+Tanto la sincronización periódica de portales como el drenado de tareas se **omiten silenciosamente mientras el agente no esté conectado** (sin JWT en el keyring): no tendría a quién mandar los documentos ni las tareas, y abrir los navegadores de Cl@ve antes de que el usuario haya pegado su token sólo serviría para asustar. El icono permanece visible para que pueda usar "Conectar".
+
 ### 5. Deduplicación de documentos
 
 El estado de sincronización se persiste en `~/.pideinfo-agent/sync_state.json`:

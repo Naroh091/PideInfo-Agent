@@ -136,8 +136,14 @@ class TrayApp:
     # ------------------------------------------------------------------
 
     async def _scheduled_sync(self) -> None:
-        """Periodic sync — skipped if already syncing."""
+        """Periodic sync — skipped if already syncing or if the user has not
+        connected their PideInfo account yet. Without a JWT we cannot push
+        anything to the backend, so opening the portal browsers would just
+        burn time and pop authentication windows on the user."""
         if self._syncing:
+            return
+        if not self._is_connected():
+            console.print("[dim]Sincronización omitida — agente sin conectar a PideInfo[/]")
             return
         self._set_syncing(True)
         try:
@@ -411,6 +417,9 @@ class TrayApp:
                 )
                 if self._drain_tasks_fn is not None:
                     async def _drain_async() -> None:
+                        # drain_tasks talks to the backend — useless without a JWT.
+                        if not self._is_connected():
+                            return
                         self._draining_tasks = True
                         self._set_syncing(True, label="comprobando tareas…")
                         try:
