@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.7.3](https://github.com/Naroh091/PideInfo-Agent/compare/v0.7.2...v0.7.3) (2026-05-18)
+
+
+### Bug Fixes
+
+* avoid sync if token has not been provided ([28155cd](https://github.com/Naroh091/PideInfo-Agent/commit/28155cdc1affe9740b2eef68558d0e5f246bc0ec))
+* manage UI in a dedicated thread ([d7a02a3](https://github.com/Naroh091/PideInfo-Agent/commit/d7a02a32662599f87568920dec8643e04792a9ff))
+
 ## [0.7.2](https://github.com/Naroh091/PideInfo-Agent/compare/v0.7.1...v0.7.2) (2026-05-18)
 
 
