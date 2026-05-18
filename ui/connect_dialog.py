@@ -1,15 +1,45 @@
 """
 Native dialogs for the agent connection flow.
 
-On macOS the tray menu callbacks run inside the AppKit run loop, so Tkinter's
-mainloop() cannot be nested on top of it.  We use osascript (a subprocess) on
-macOS so the dialog runs completely outside the run loop.  Tkinter is used as
-the fallback on Windows and Linux, where there is no such conflict.
+Tray-menu callbacks are invoked from inside pystray's own message loop —
+AppKit on macOS, ``TrackPopupMenuEx`` on Windows. Nesting a Tk ``mainloop()``
+on top of that context breaks keyboard focus on the Entry widget and
+prevents ``root.destroy()`` from unwinding the loop (Cancel / window-X do
+nothing). macOS sidesteps it via ``osascript``; Windows and Linux run each
+Tk dialog in a dedicated thread so it owns a clean message queue.
 """
 from __future__ import annotations
 
 import subprocess
 import sys
+import threading
+from typing import Callable, TypeVar
+
+_T = TypeVar("_T")
+
+
+def _run_in_dedicated_thread(fn: Callable[[], _T]) -> _T:
+    """Run a Tk dialog builder in its own thread and return its result.
+
+    A fresh thread keeps Tk out of pystray's menu-callback context. The
+    Tcl interpreter is created, used, and destroyed entirely within the
+    worker thread, which satisfies Tkinter's single-thread affinity rule.
+    """
+    holder: list = [None]
+    err: list[BaseException | None] = [None]
+
+    def _runner() -> None:
+        try:
+            holder[0] = fn()
+        except BaseException as exc:  # noqa: BLE001 — re-raised to caller
+            err[0] = exc
+
+    t = threading.Thread(target=_runner, name="pideinfo-tk-dialog", daemon=False)
+    t.start()
+    t.join()
+    if err[0] is not None:
+        raise err[0]
+    return holder[0]
 
 
 # ---------------------------------------------------------------------------
@@ -235,24 +265,24 @@ def show_settings_dialog(current_url: str) -> "str | None":
     clear the override), or None if the user cancelled."""
     if sys.platform == "darwin":
         return _show_settings_dialog_macos(current_url)
-    return _show_settings_dialog_tk(current_url)
+    return _run_in_dedicated_thread(lambda: _show_settings_dialog_tk(current_url))
 
 
 def show_connect_dialog() -> "str | None":
     if sys.platform == "darwin":
         return _show_connect_dialog_macos()
-    return _show_connect_dialog_tk()
+    return _run_in_dedicated_thread(_show_connect_dialog_tk)
 
 
 def show_connected_card(name: str, email: str) -> None:
     if sys.platform == "darwin":
         _show_connected_card_macos(name, email)
     else:
-        _show_connected_card_tk(name, email)
+        _run_in_dedicated_thread(lambda: _show_connected_card_tk(name, email))
 
 
 def show_error_dialog(message: str) -> None:
     if sys.platform == "darwin":
         _show_error_dialog_macos(message)
     else:
-        _show_error_dialog_tk(message)
+        _run_in_dedicated_thread(lambda: _show_error_dialog_tk(message))
