@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.0](https://github.com/Naroh091/PideInfo-Agent/compare/v0.7.6...v0.8.0) (2026-05-20)
+
+
+### Features
+
+* gate uncertain tasks ([71c0fa2](https://github.com/Naroh091/PideInfo-Agent/commit/71c0fa29d5e9558b30ad9b2c8e51a20aa93e1659))
+
 ## [0.7.6](https://github.com/Naroh091/PideInfo-Agent/compare/v0.7.5...v0.7.6) (2026-05-20)
 
 
