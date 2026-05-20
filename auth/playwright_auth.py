@@ -94,6 +94,7 @@ async def authenticate(
     if headless or cert_ready:
         firefox_user_prefs["security.default_personal_cert"] = "Select Automatically"
 
+    cookies_dict: dict[str, str] = {}
     async with async_playwright() as p:
         launch_kwargs: dict[str, Any] = dict(
             headless=headless,
@@ -153,13 +154,7 @@ async def authenticate(
             console.print("[bold green]Autenticación completada[/]")
 
             cookies = await context.cookies(portal_url)
-            if firefox_profile_dir is not None:
-                (firefox_profile_dir / ".pideinfo-cert-ready").touch()
-                # Promote to master if one isn't trained yet — bootstraps the
-                # seed source for all other portals.
-                from auth.profile_seed import promote_to_master
-                promote_to_master(firefox_profile_dir, firefox_profile_master)
-            return _cookies_to_dict(cookies)
+            cookies_dict = _cookies_to_dict(cookies)
 
         except Exception as e:
             error_msg = str(e)
@@ -176,6 +171,22 @@ async def authenticate(
 
         finally:
             await context.close()
+
+    # The browser is fully closed now, so the profile directory is no longer
+    # locked. Only here is it safe to mark and copy it: on Windows Firefox
+    # holds parent.lock (and other profile files) with an exclusive lock while
+    # it runs, so copying mid-session raises PermissionError [Errno 13].
+    if firefox_profile_dir is not None:
+        (firefox_profile_dir / ".pideinfo-cert-ready").touch()
+        try:
+            # Promote to master if one isn't trained yet — bootstraps the
+            # seed source for all other portals.
+            from auth.profile_seed import promote_to_master
+            promote_to_master(firefox_profile_dir, firefox_profile_master)
+        except Exception as exc:  # profile-copy is an optimisation, never fatal
+            console.print(f"[dim]No se pudo promover el perfil maestro: {exc}[/]")
+
+    return cookies_dict
 
 
 def _cookies_to_dict(cookies: list[dict[str, Any]]) -> dict[str, str]:

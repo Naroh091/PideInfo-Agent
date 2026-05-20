@@ -20,7 +20,7 @@ Usage at the top of every auth flow:
 
     seed_from_master(profile_dir, master_dir)
     # ... launch_persistent_context(user_data_dir=profile_dir) ...
-    # On successful auth:
+    # On successful auth, AFTER the browser context is closed:
     promote_to_master(profile_dir, master_dir)
 """
 
@@ -32,12 +32,35 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# Firefox lock files are process-specific and must never be copied into another
+# profile. On Windows in particular, Firefox holds `parent.lock` open with an
+# exclusive share mode while it runs, so `shutil.copy2` trying to read it
+# raises `PermissionError: [Errno 13] Permission denied`.
+_SKIP_NAMES = frozenset({"parent.lock", "lock", ".parentlock"})
+
 
 def _is_trained(profile: Path) -> bool:
     """A profile is "trained" once Firefox has written `cert9.db` (the cert
     decision DB) and `prefs.js` (the chosen `security.default_personal_cert`
     preference). Both are required for silent re-auth."""
     return (profile / "cert9.db").exists() and (profile / "prefs.js").exists()
+
+
+def _copy_profile(src: Path, dst: Path) -> None:
+    """Copy every entry of Firefox profile `src` into `dst`, skipping the
+    process-specific lock files (see `_SKIP_NAMES`). Creates `dst` if missing.
+
+    The caller must ensure no Firefox instance is using `src` — on Windows the
+    profile's files are held with exclusive locks while the browser runs."""
+    dst.mkdir(parents=True, exist_ok=True)
+    for child in src.iterdir():
+        if child.name in _SKIP_NAMES:
+            continue
+        dest = dst / child.name
+        if child.is_dir():
+            shutil.copytree(child, dest, dirs_exist_ok=True)
+        else:
+            shutil.copy2(child, dest)
 
 
 def seed_from_master(profile_dir: Path, master_dir: Path | None) -> None:
@@ -51,35 +74,26 @@ def seed_from_master(profile_dir: Path, master_dir: Path | None) -> None:
         # Caller will train this profile from scratch (headed first run).
         profile_dir.mkdir(parents=True, exist_ok=True)
         return
-    # Copy the master. dirs_exist_ok handles the case where profile_dir was
-    # mkdir'd already (e.g. by an earlier failed seeding attempt).
-    profile_dir.mkdir(parents=True, exist_ok=True)
-    for child in master_dir.iterdir():
-        dest = profile_dir / child.name
-        if child.is_dir():
-            shutil.copytree(child, dest, dirs_exist_ok=True)
-        else:
-            shutil.copy2(child, dest)
+    # Copy the master. `_copy_profile` uses dirs_exist_ok internally, so a
+    # profile_dir mkdir'd by an earlier failed seeding attempt is fine.
+    _copy_profile(master_dir, profile_dir)
     logger.info("Seeded Firefox profile %s from master %s", profile_dir, master_dir)
 
 
 def promote_to_master(profile_dir: Path, master_dir: Path | None) -> None:
     """If `master_dir` is empty/un-trained but `profile_dir` is trained,
     copy `profile_dir` → `master_dir`. Bootstraps the master from whichever
-    portal happens to authenticate first."""
+    portal happens to authenticate first.
+
+    Must be called only AFTER the browser context using `profile_dir` has
+    been closed — Firefox holds the profile locked while it runs."""
     if master_dir is None:
         return
     if _is_trained(master_dir):
         return
     if not _is_trained(profile_dir):
         return
-    master_dir.mkdir(parents=True, exist_ok=True)
-    for child in profile_dir.iterdir():
-        dest = master_dir / child.name
-        if child.is_dir():
-            shutil.copytree(child, dest, dirs_exist_ok=True)
-        else:
-            shutil.copy2(child, dest)
+    _copy_profile(profile_dir, master_dir)
     logger.info("Promoted %s to master profile at %s", profile_dir, master_dir)
 
 
@@ -94,11 +108,5 @@ def migrate_legacy_profile(legacy: Path, master: Path) -> None:
         return
     if _is_trained(master):
         return
-    master.mkdir(parents=True, exist_ok=True)
-    for child in legacy.iterdir():
-        dest = master / child.name
-        if child.is_dir():
-            shutil.copytree(child, dest, dirs_exist_ok=True)
-        else:
-            shutil.copy2(child, dest)
+    _copy_profile(legacy, master)
     logger.info("Migrated legacy profile %s → master %s", legacy, master)

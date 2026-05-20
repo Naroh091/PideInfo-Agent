@@ -211,8 +211,14 @@ async def _drive(
                     await asyncio.sleep(60)
             raise
 
-        # Promote the profile so other portals don't have to re-prompt for the cert.
+    # Promote the profile so other portals don't have to re-prompt for the
+    # cert. Done AFTER the `async with` above closes the browser context — on
+    # Windows Firefox holds the profile locked (parent.lock & co.) while it
+    # runs, so an in-session copy raises PermissionError [Errno 13].
+    try:
         promote_to_master(profile_dir, settings.firefox_profile_master)
+    except Exception as exc:  # profile-copy is an optimisation, never fatal
+        console.print(f"[dim]No se pudo promover el perfil maestro: {exc}[/]")
 
     # -- Post-submission webhook (out of the browser context) --------------
     upload_summaries: list[dict] = []
