@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.6](https://github.com/Naroh091/PideInfo-Agent/compare/v0.7.5...v0.7.6) (2026-05-20)
+
+
+### Bug Fixes
+
+* increase timeouts for Portal de Transparencia ([ff74494](https://github.com/Naroh091/PideInfo-Agent/commit/ff7449478cd8b2ab1a5e0506405b0c7aefc327a0))
+
 ## [0.7.5](https://github.com/Naroh091/PideInfo-Agent/compare/v0.7.4...v0.7.5) (2026-05-20)
 
 
