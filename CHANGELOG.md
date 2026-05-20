@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.5](https://github.com/Naroh091/PideInfo-Agent/compare/v0.7.4...v0.7.5) (2026-05-20)
+
+
+### Bug Fixes
+
+* **windows:** skip FF lock files when copying profiles ([4a07af6](https://github.com/Naroh091/PideInfo-Agent/commit/4a07af65c551a7381a792495e4171f2cb25514ac))
+
 ## [0.7.4](https://github.com/Naroh091/PideInfo-Agent/compare/v0.7.3...v0.7.4) (2026-05-18)
 
 
