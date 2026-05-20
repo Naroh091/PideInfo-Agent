@@ -18,7 +18,7 @@ class _ClientProto(Protocol):
     base_url: str
     def claim_task(self, task_id: str) -> dict | None: ...
     def progress_task(self, task_id: str, status: str, note: str | None = ...) -> None: ...
-    def complete_task(self, task_id: str, success: bool, *, result: dict | None = ..., error: str | None = ...) -> None: ...
+    def complete_task(self, task_id: str, success: bool = ..., *, outcome: str | None = ..., result: dict | None = ..., error: str | None = ...) -> None: ...
     def download_pdf(self, path: str) -> bytes: ...
 
 
@@ -47,18 +47,25 @@ class _NotifyingClient:
     def __getattr__(self, name):
         return getattr(self._inner, name)
 
-    def complete_task(self, task_id, success, *, result=None, error=None):
+    def complete_task(self, task_id, success=False, *, outcome=None, result=None, error=None):
         if not self._notified and task_id == self._task_id:
             self._notified = True
             try:
                 from notifier.desktop import notify_task_succeeded, notify_task_failed
-                if success:
+                # 'outcome' (done|failed|uncertain) tiene prioridad; si no se
+                # da, se deriva del booleano 'success'. Solo 'done' es éxito;
+                # 'uncertain' se notifica como no-éxito (la firma no se pudo
+                # confirmar).
+                succeeded = (outcome == "done") if outcome else success
+                if succeeded:
                     notify_task_succeeded(self._task_type, result)
                 else:
                     notify_task_failed(self._task_type, error)
             except Exception:
                 logger.exception("notify on complete_task failed")
-        return self._inner.complete_task(task_id, success, result=result, error=error)
+        return self._inner.complete_task(
+            task_id, success, outcome=outcome, result=result, error=error
+        )
 
 
 def _notify_started(task: dict) -> None:

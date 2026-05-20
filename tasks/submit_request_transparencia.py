@@ -34,6 +34,7 @@ import os
 import platform
 from pathlib import Path
 from typing import Any, Optional
+from tasks._submission import UncertainSubmission
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +69,23 @@ def handle(task: dict, client: Any) -> None:
 
     try:
         result = asyncio.run(_drive(payload, console, client, task_id, mode, work_dir))
+    except UncertainSubmission as e:
+        logger.warning("submit_request_transparencia uncertain: %s", e)
+        try:
+            from observability import capture_exception
+            capture_exception(e, task_type="submit_request_transparencia", task_id=task_id, mode=mode)
+        except Exception:
+            pass
+        client.complete_task(
+            task_id, outcome="uncertain",
+            error=f"submission_uncertain:{e!s}"[:2000],
+            result={"mode": mode, "work_dir": str(work_dir), "markers": e.markers},
+        )
+        console.print(
+            f"[yellow]Tarea {task_id[:8]} incierta — la firma pudo completarse en el portal; "
+            f"se reconciliará en el próximo envío[/]"
+        )
+        return
     except Exception as e:
         logger.exception("submit_request_transparencia pipeline crashed")
         try:
@@ -154,49 +172,70 @@ async def _drive(
         client.progress_task(task_id, status="in_progress", note="Refrescando sesión Cl@ve")
         await _warm_up_clave_session(page, portal_url, console)
 
-        client.progress_task(task_id, status="in_progress", note="Abriendo wizard PT")
-        await page.goto(wizard_url, wait_until="domcontentloaded")
-        if "/error/401" in page.url:
-            from auth.session_manager import SessionExpiredError
-            raise SessionExpiredError(
-                f"transparencia: 401 al abrir el wizard tras warm-up ({page.url})."
-            )
-
-        # Wait for the dnt-* runtime to load and at least one dnt-input to render.
-        try:
-            await page.wait_for_function(
-                "document.querySelectorAll('dnt-input').length > 0",
-                timeout=20_000,
-            )
-        except Exception:
-            await _capture_failure(page, work_dir, "wizard_did_not_render")
-            raise
+        reconcile_id_borr = payload.get("reconcile_idBorr")
 
         try:
-            client.progress_task(task_id, status="in_progress", note="Paso 1: Datos del solicitante")
-            await _step1_advance(page, payload.get("solicitante") or {}, console)
+            if reconcile_id_borr:
+                console.print(
+                    f"[bold]Reconciliación[/]: reutilizando borrador idBorr={reconcile_id_borr}"
+                )
+                client.progress_task(task_id, status="in_progress",
+                                     note=f"Reconciliando borrador {reconcile_id_borr}")
+                id_borr = str(reconcile_id_borr)
+                firma_url = (
+                    f"{portal_url}/procedimiento/firma"
+                    f"?idProc=133628&idBorr={id_borr}&idAmb={id_amb}"
+                )
+                await page.goto(firma_url, wait_until="domcontentloaded")
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=30_000)
+                except Exception:
+                    pass
 
-            client.progress_task(task_id, status="in_progress", note="Paso 2: Asunto y solicitud")
-            await _step2_fill_request(page, payload, console)
-            id_borr = await _step2_submit_capture_id_borr(page, console)
+                if "/procedimiento/firma" not in page.url:
+                    # El portal nos sacó de /firma → el borrador YA está
+                    # registrado. No se vuelve a firmar: solo se captura.
+                    console.print("[green]Reconciliación: el borrador ya estaba registrado[/]")
+                else:
+                    # Sigue siendo borrador → reanudar la firma sobre ESTE.
+                    console.print("[dim]Reconciliación: el borrador sigue sin firmar; se reanuda[/]")
+                    await _step3_sign(page, console, id_borr=id_borr)
+            else:
+                client.progress_task(task_id, status="in_progress", note="Abriendo wizard PT")
+                await page.goto(wizard_url, wait_until="domcontentloaded")
+                if "/error/401" in page.url:
+                    from auth.session_manager import SessionExpiredError
+                    raise SessionExpiredError(
+                        f"transparencia: 401 al abrir el wizard tras warm-up ({page.url})."
+                    )
+                try:
+                    await page.wait_for_function(
+                        "document.querySelectorAll('dnt-input').length > 0",
+                        timeout=20_000,
+                    )
+                except Exception:
+                    await _capture_failure(page, work_dir, "wizard_did_not_render")
+                    raise
 
-            client.progress_task(task_id, status="in_progress", note="Paso 3: Firma básica")
-            await _step3_sign(page, console)
+                client.progress_task(task_id, status="in_progress", note="Paso 1: Datos del solicitante")
+                await _step1_advance(page, payload.get("solicitante") or {}, console)
+
+                client.progress_task(task_id, status="in_progress", note="Paso 2: Asunto y solicitud")
+                await _step2_fill_request(page, payload, console)
+                id_borr = await _step2_submit_capture_id_borr(page, console)
+
+                client.progress_task(task_id, status="in_progress", note="Paso 3: Firma básica")
+                await _step3_sign(page, console, id_borr=id_borr)
 
             client.progress_task(task_id, status="in_progress", note="Capturando justificante")
             id_exp, expediente_ref, downloaded_files = await _capture_receipt(
                 page, context, work_dir, console, id_borr=id_borr,
             )
-            # Successful signing must produce either an idExp or an
-            # expedienteRef. If we only have idBorr, the firma never
-            # completed and the request is still a draft — fail loudly
-            # so the user knows to retry instead of seeing a misleading
-            # success notification.
             if not id_exp and not expediente_ref:
-                raise RuntimeError(
-                    f"firma_no_registrada: solo tenemos idBorr={id_borr!r}, "
-                    f"el portal no devolvió idExp ni expedienteRef "
-                    f"(URL final: {page.url}). La solicitud quedó como borrador."
+                raise UncertainSubmission(
+                    f"firma_no_registrada: salimos de /firma pero sin idExp ni "
+                    f"expedienteRef (URL: {page.url}); idBorr={id_borr!r}",
+                    markers={"idBorr": id_borr} if id_borr else {},
                 )
             external_id = expediente_ref or id_exp
             justificante_path = downloaded_files.get("Justificante") or downloaded_files.get("Solicitud")
@@ -243,6 +282,7 @@ async def _drive(
         "expedienteRef": expediente_ref,
         "idExp": id_exp,
         "idBorr": id_borr,
+        "markers": {"idBorr": id_borr} if id_borr else {},
         "sentAt": _utcnow_iso(),
         "registry_no": external_id,
         "downloads": {label: str(p) for label, p in downloaded_files.items()},
@@ -414,7 +454,7 @@ async def _portal_is_processing(page) -> bool:
         return False
 
 
-async def _step3_sign(page, console) -> None:
+async def _step3_sign(page, console, *, id_borr: Optional[str]) -> None:
     """Pick "Firma básica" (value=basica), tick both mandatory checkboxes,
     click "Siguiente", and survive the Cl@ve round-trip.
 
@@ -435,73 +475,56 @@ async def _step3_sign(page, console) -> None:
     await _check_all_dnt_checkboxes(page)
     await _click_dnt_button(page, "Siguiente")
 
-    # The Siguiente click triggers either:
-    #   (a) navigation to clave.gob.es / pasarela-ident.clave.gob.es
-    #   (b) inline transition to the confirmation page (no clave bounce)
-    # Wait for ANY navigation off /procedimiento/firma OR the appearance
-    # of a clave URL. Server side this can be slow (mint of signValidation
-    # token + SAML AuthnRequest), so the timeout is generous.
+    # ── PUNTO DE NO RETORNO ──────────────────────────────────────────────
+    # A partir del clic anterior la firma se ha enviado: el portal puede
+    # cerrar el registro server-side aunque perdamos visibilidad. Cualquier
+    # fallo de aquí en adelante es 'uncertain', no 'failed'.
     try:
-        await page.wait_for_url(
-            lambda url: ("clave.gob.es" in url) or ("/procedimiento/firma" not in url),
-            timeout=120_000,
-        )
-    except Exception:
-        errors = await _collect_validation_errors(page)
-        raise RuntimeError(
-            "step3_did_not_advance: " + ("; ".join(errors[:6]) if errors else page.url)
-        )
-
-    # If we ended up on Cl@ve, ride the bounce back. The persistent FNMT
-    # profile usually picks the cert without prompting; if it stalls (e.g.
-    # the user hasn't completed the cert picker yet), we time out.
-    if "clave.gob.es" in page.url:
-        console.print("[dim]transparencia: pasarela Cl@ve detectada para confirmación de firma[/]")
-        # Try a few selectors for the AFIRMA / DNIe option in case the
-        # markup changes between runs (same set as the warm-up handshake).
-        selectors = [
-            'button[onclick*="AFIRMA"]',
-            'button[onclick*="afirma"]',
-            'a[href*="AFIRMA"]',
-            'button:has-text("DNIe")',
-            'button:has-text("Certificado electrónico")',
-        ]
-        for sel in selectors:
-            try:
-                btn = page.locator(sel).first
-                await btn.wait_for(state="visible", timeout=5_000)
-                await btn.click()
-                console.print(f"[dim]transparencia: AFIRMA clic via {sel!r} (firma)[/]")
-                break
-            except Exception:
-                continue
+        # The Siguiente click triggers either:
+        #   (a) navigation to clave.gob.es / pasarela-ident.clave.gob.es
+        #   (b) inline transition to the confirmation page (no clave bounce)
         try:
+            await page.wait_for_url(
+                lambda url: ("clave.gob.es" in url) or ("/procedimiento/firma" not in url),
+                timeout=120_000,
+            )
+        except Exception:
+            errors = await _collect_validation_errors(page)
+            raise RuntimeError(
+                "step3_did_not_advance: " + ("; ".join(errors[:6]) if errors else page.url)
+            )
+
+        if "clave.gob.es" in page.url:
+            console.print("[dim]transparencia: pasarela Cl@ve detectada para confirmación de firma[/]")
+            selectors = [
+                'button[onclick*="AFIRMA"]',
+                'button[onclick*="afirma"]',
+                'a[href*="AFIRMA"]',
+                'button:has-text("DNIe")',
+                'button:has-text("Certificado electrónico")',
+            ]
+            for sel in selectors:
+                try:
+                    btn = page.locator(sel).first
+                    await btn.wait_for(state="visible", timeout=5_000)
+                    await btn.click()
+                    console.print(f"[dim]transparencia: AFIRMA clic via {sel!r} (firma)[/]")
+                    break
+                except Exception:
+                    continue
             await page.wait_for_url("**/transparencia.sede.gob.es/**", timeout=180_000)
             console.print("[green]transparencia: vuelta de Cl@ve OK[/]")
-        except Exception as e:
-            from auth.session_manager import SessionExpiredError
-            raise SessionExpiredError(
-                f"transparencia: timeout esperando vuelta de Cl@ve tras la firma ({page.url})"
-            ) from e
 
-    # Final wait: confirm we left /procedimiento/firma. The portal lands on
-    # /procedimiento/confirmacionSolicitud?idExp=N when registration succeeds.
-    #
-    # We used to be lenient about ``signValidation`` in the URL but that's a
-    # FALSE positive: the portal stamps signValidation while the borrador is
-    # still pending non-repudiation confirmation, NOT after success. Treating
-    # it as success caused the task to report success while the request
-    # stayed as a draft on the portal. Require the URL to actually leave
-    # /procedimiento/firma.
-    try:
+        # Final wait: confirm we left /procedimiento/firma. The portal lands on
+        # /procedimiento/confirmacionSolicitud?idExp=N when registration succeeds.
         await page.wait_for_url(
             lambda url: "/procedimiento/firma" not in url,
             timeout=360_000,
         )
     except Exception as e:
-        raise RuntimeError(
-            f"step3_stuck_on_firma: la firma no se completó, el portal sigue en {page.url} "
-            "(probablemente la solicitud quedó como borrador)"
+        raise UncertainSubmission(
+            f"step3_firma_sin_confirmar: {e} (URL: {page.url})",
+            markers={"idBorr": id_borr} if id_borr else {},
         ) from e
 
 

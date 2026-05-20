@@ -30,6 +30,8 @@ import re
 from pathlib import Path
 from typing import Any, Optional
 
+from tasks._submission import UncertainSubmission
+
 logger = logging.getLogger(__name__)
 
 _WIZARD_URL = "https://reg.redsara.es/es/nuevo-registro"
@@ -65,6 +67,23 @@ def handle(task: dict, client: Any) -> None:
 
     try:
         result = asyncio.run(_drive(payload, console, client, task_id, mode, work_dir))
+    except UncertainSubmission as e:
+        logger.warning("submit_request_reg uncertain: %s", e)
+        try:
+            from observability import capture_exception
+            capture_exception(e, task_type="submit_request_reg", task_id=task_id, mode=mode)
+        except Exception:
+            pass
+        client.complete_task(
+            task_id, outcome="uncertain",
+            error=f"submission_uncertain:{e!s}"[:2000],
+            result={"mode": mode, "work_dir": str(work_dir), "markers": e.markers},
+        )
+        console.print(
+            f"[yellow]Tarea {task_id[:8]} incierta — la firma pudo completarse en REG; "
+            f"revísalo antes de reenviar[/]"
+        )
+        return
     except Exception as e:
         logger.exception("submit_request_reg pipeline crashed")
         try:
@@ -554,77 +573,87 @@ async def _step4_firma(
     if not clicked:
         raise RuntimeError("firmar_button_not_found")
 
-    # Esperamos a que (a) entremos en la pasarela Cl@ve o (b) lleguemos
-    # ya a la página de detalle del registro. El timeout es generoso
-    # porque la firma puede tardar mientras se elige el certificado.
+    # ── PUNTO DE NO RETORNO: la firma REG se ha enviado ──
     try:
-        await page.wait_for_url(
-            lambda url: (
-                "clave.gob.es" in url
-                or "/detalle-registro/" in url
-                or _regage_in_url(url)
-            ),
-            timeout=180_000,
-        )
-    except Exception as e:
-        raise RuntimeError(f"firma_no_progreso: {page.url}") from e
-
-    if "clave.gob.es" in page.url:
-        console.print("[dim]REG: pasarela Cl@ve detectada — eligiendo DNIe/Certificado[/]")
-        # Preferimos siempre certificado electrónico (FNMT pre-cargado en
-        # el perfil Firefox); si no, caemos a otros métodos disponibles.
-        for sel in (
-            'button:has-text("Acceso DNIe / Certificado electrónico")',
-            'a:has-text("Acceso DNIe / Certificado electrónico")',
-            'button:has-text("Certificado electrónico")',
-            'button:has-text("DNIe")',
-            'button[onclick*="AFIRMA"]', 'button[onclick*="afirma"]',
-            'a[href*="AFIRMA"]',
-        ):
-            try:
-                btn = page.locator(sel).first
-                await btn.wait_for(state="visible", timeout=5_000)
-                await btn.click()
-                console.print(f"[dim]REG: AFIRMA clic via {sel!r}[/]")
-                break
-            except Exception:
-                continue
+        # Esperamos a que (a) entremos en la pasarela Cl@ve o (b) lleguemos
+        # ya a la página de detalle del registro. El timeout es generoso
+        # porque la firma puede tardar mientras se elige el certificado.
         try:
-            await page.wait_for_url("**reg.redsara.es/es/detalle-registro/**", timeout=180_000)
+            await page.wait_for_url(
+                lambda url: (
+                    "clave.gob.es" in url
+                    or "/detalle-registro/" in url
+                    or _regage_in_url(url)
+                ),
+                timeout=180_000,
+            )
         except Exception as e:
-            from auth.session_manager import SessionExpiredError
-            raise SessionExpiredError(
-                f"REG: timeout esperando vuelta de Cl@ve tras la firma ({page.url})"
-            ) from e
+            raise RuntimeError(f"firma_no_progreso: {page.url}") from e
 
-    # Recuperar número REGAGE de la página de confirmación.
-    registry_number: Optional[str] = None
-    try:
-        body_text = await page.locator("body").inner_text(timeout=5_000)
-        m = re.search(r"(REGAGE\d{2}[a-z0-9]+)", body_text, re.IGNORECASE)
+        if "clave.gob.es" in page.url:
+            console.print("[dim]REG: pasarela Cl@ve detectada — eligiendo DNIe/Certificado[/]")
+            # Preferimos siempre certificado electrónico (FNMT pre-cargado en
+            # el perfil Firefox); si no, caemos a otros métodos disponibles.
+            for sel in (
+                'button:has-text("Acceso DNIe / Certificado electrónico")',
+                'a:has-text("Acceso DNIe / Certificado electrónico")',
+                'button:has-text("Certificado electrónico")',
+                'button:has-text("DNIe")',
+                'button[onclick*="AFIRMA"]', 'button[onclick*="afirma"]',
+                'a[href*="AFIRMA"]',
+            ):
+                try:
+                    btn = page.locator(sel).first
+                    await btn.wait_for(state="visible", timeout=5_000)
+                    await btn.click()
+                    console.print(f"[dim]REG: AFIRMA clic via {sel!r}[/]")
+                    break
+                except Exception:
+                    continue
+            try:
+                await page.wait_for_url("**reg.redsara.es/es/detalle-registro/**", timeout=180_000)
+            except Exception as e:
+                from auth.session_manager import SessionExpiredError
+                raise SessionExpiredError(
+                    f"REG: timeout esperando vuelta de Cl@ve tras la firma ({page.url})"
+                ) from e
+
+        # Recuperar número REGAGE de la página de confirmación.
+        registry_number: Optional[str] = None
+        try:
+            body_text = await page.locator("body").inner_text(timeout=5_000)
+            m = re.search(r"(REGAGE\d{2}[a-z0-9]+)", body_text, re.IGNORECASE)
+            if m:
+                registry_number = m.group(1)
+        except Exception:
+            pass
+
+        if not registry_number:
+            # Algunos REG ponen el número en la propia URL como query param.
+            m = re.search(r"REGAGE\d{2}[a-z0-9]+", page.url, re.IGNORECASE)
+            if m:
+                registry_number = m.group(0)
+
+        # UUID del registro: la URL tras la firma es
+        # https://reg.redsara.es/es/detalle-registro/{uuid}[/...]
+        registry_uuid: Optional[str] = None
+        m = re.search(r"/detalle-registro/([0-9a-f-]{36})", page.url, re.IGNORECASE)
         if m:
-            registry_number = m.group(1)
-    except Exception:
-        pass
+            registry_uuid = m.group(1)
+        else:
+            console.print(
+                f"[yellow]REG: no se pudo extraer registry_uuid de la URL ({page.url})[/]"
+            )
 
-    if not registry_number:
-        # Algunos REG ponen el número en la propia URL como query param.
-        m = re.search(r"REGAGE\d{2}[a-z0-9]+", page.url, re.IGNORECASE)
-        if m:
-            registry_number = m.group(0)
+        return registry_number, registry_uuid
 
-    # UUID del registro: la URL tras la firma es
-    # https://reg.redsara.es/es/detalle-registro/{uuid}[/...]
-    registry_uuid: Optional[str] = None
-    m = re.search(r"/detalle-registro/([0-9a-f-]{36})", page.url, re.IGNORECASE)
-    if m:
-        registry_uuid = m.group(1)
-    else:
-        console.print(
-            f"[yellow]REG: no se pudo extraer registry_uuid de la URL ({page.url})[/]"
-        )
-
-    return registry_number, registry_uuid
+    except UncertainSubmission:
+        raise
+    except Exception as e:
+        raise UncertainSubmission(
+            f"reg_firma_sin_confirmar: {e}",
+            markers={},
+        ) from e
 
 
 # ─────────────────────────────────────────────────────────────────────────

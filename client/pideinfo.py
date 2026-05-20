@@ -148,12 +148,16 @@ class PideInfoClient:
     def complete_task(
         self,
         task_id: str,
-        success: bool,
+        success: bool = False,
         *,
+        outcome: str | None = None,
         result: dict | None = None,
         error: str | None = None,
     ) -> None:
-        body: dict = {"success": success}
+        """Cierra una tarea. ``outcome`` (done|failed|uncertain) tiene
+        prioridad; si no se da, se deriva del booleano ``success`` por
+        compatibilidad con los callers antiguos."""
+        body: dict = {"outcome": outcome} if outcome else {"success": success}
         if result is not None:
             body["result"] = result
         if error is not None:

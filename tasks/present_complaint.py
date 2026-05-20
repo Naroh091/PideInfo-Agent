@@ -17,6 +17,7 @@ import platform
 import tempfile
 from pathlib import Path
 from typing import Any, Optional
+from tasks._submission import UncertainSubmission
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +83,25 @@ def handle(task: dict, client: Any) -> None:
     # Drive Playwright in our own asyncio loop.
     try:
         result = asyncio.run(_drive_form(payload, files, console, client, task_id, mode, work_dir))
+    except UncertainSubmission as e:
+        logger.warning("present_complaint uncertain: %s", e)
+        try:
+            from observability import capture_exception
+            capture_exception(e, task_type="present_complaint", task_id=task_id, mode=mode)
+        except Exception:
+            pass
+        client.complete_task(
+            task_id, outcome="uncertain",
+            error=f"submission_uncertain:{e!s}"[:2000],
+            result={"mode": mode,
+                    "files": {k: str(v) if v else None for k, v in files.items()},
+                    "markers": e.markers},
+        )
+        console.print(
+            f"[yellow]Tarea {task_id[:8]} incierta — la reclamación pudo registrarse en CTBG; "
+            f"revísalo antes de reenviar[/]"
+        )
+        return
     except Exception as e:
         logger.exception("present_complaint pipeline crashed")
         try:
@@ -169,7 +189,6 @@ async def _drive_form(
             pass
 
         filler = CtbgComplaintFiller(page, payload, files, download_dir=work_dir)
-        step6_result: Optional[dict] = None
         try:
             client.progress_task(task_id, status="in_progress", note="Paso 1: Identificación")
             await filler._step1_identification()
@@ -181,8 +200,6 @@ async def _drive_form(
             await filler._step4_declaro()
             client.progress_task(task_id, status="in_progress", note="Paso 5: Firmar")
             await filler._step5_sign()
-            client.progress_task(task_id, status="in_progress", note="Paso 6: Acuse de recibo")
-            step6_result = await filler._step6_acuse()
         except Exception as e:
             screenshot = (Path.home() / "Downloads" / "PideInfo" /
                           f"agent_failure_{task_id[:8]}.png")
@@ -220,54 +237,73 @@ async def _drive_form(
                     await asyncio.sleep(60)
             raise
 
-        registry_no = (step6_result or {}).get("registry_no")
-        csv = (step6_result or {}).get("csv")
-        downloads = (step6_result or {}).get("downloads") or {}
+        # ── PUNTO DE NO RETORNO: la firma CTBG se ha enviado ──
+        try:
+            client.progress_task(task_id, status="in_progress", note="Paso 6: Acuse de recibo")
+            step6_result = await filler._step6_acuse()
 
-        # Push the receipt/signed instance back to PideInfo and persist the
-        # registry number on AccessRequestComplaint so the user sees the
-        # complaint marked as filed.
-        upload_summary: dict = {}
-        if registry_no:
-            try:
-                client.mark_complaint_filed(
-                    access_request_id=payload["access_request_id"],
-                    registry_no=registry_no,
-                    csv=csv,
-                    filed_at=None,  # backend defaults to today
-                )
-            except Exception:
-                logger.exception("mark_complaint_filed failed")
+            registry_no = (step6_result or {}).get("registry_no")
+            csv = (step6_result or {}).get("csv")
+            downloads = (step6_result or {}).get("downloads") or {}
 
-            files_to_upload: dict[str, Path] = {}
-            if downloads.get("recibo"):
-                files_to_upload["Recibo"] = Path(downloads["recibo"])
-            if downloads.get("instancia_firmada"):
-                files_to_upload["Instancia firmada"] = Path(downloads["instancia_firmada"])
-
-            if files_to_upload:
+            # Push the receipt/signed instance back to PideInfo and persist the
+            # registry number on AccessRequestComplaint so the user sees the
+            # complaint marked as filed.
+            upload_summary: dict = {}
+            if registry_no:
                 try:
-                    upload_summary = await client.upload_filed_complaint_documents(
+                    client.mark_complaint_filed(
+                        access_request_id=payload["access_request_id"],
                         registry_no=registry_no,
-                        files=files_to_upload,
+                        csv=csv,
+                        filed_at=None,  # backend defaults to today
                     )
                 except Exception:
-                    logger.exception("upload_filed_complaint_documents failed")
+                    logger.exception("mark_complaint_filed failed")
 
-        # If this run trained the CTBG profile (fresh install path) bootstrap
-        # the master so other portals can seed from it without re-prompting.
-        promote_to_master(profile_dir, settings.firefox_profile_master)
+                files_to_upload: dict[str, Path] = {}
+                if downloads.get("recibo"):
+                    files_to_upload["Recibo"] = Path(downloads["recibo"])
+                if downloads.get("instancia_firmada"):
+                    files_to_upload["Instancia firmada"] = Path(downloads["instancia_firmada"])
 
-        return {
-            "status": "registered" if registry_no else "awaiting_signature",
-            "mode": mode,
-            "stopped_at_step": 6,
-            "registry_no": registry_no,
-            "csv": csv,
-            "files": {k: str(v) if v else None for k, v in files.items()},
-            "downloads": {k: str(v) for k, v in downloads.items()},
-            "upload_summary": upload_summary,
-        }
+                if files_to_upload:
+                    try:
+                        upload_summary = await client.upload_filed_complaint_documents(
+                            registry_no=registry_no,
+                            files=files_to_upload,
+                        )
+                    except Exception:
+                        logger.exception("upload_filed_complaint_documents failed")
+
+            # If this run trained the CTBG profile (fresh install path) bootstrap
+            # the master so other portals can seed from it without re-prompting.
+            promote_to_master(profile_dir, settings.firefox_profile_master)
+
+            if not registry_no:
+                raise UncertainSubmission(
+                    "ctbg_sin_registry_no: la firma se completó pero el portal no "
+                    "devolvió número de registro",
+                    markers={},
+                )
+
+            return {
+                "status": "registered",
+                "mode": mode,
+                "stopped_at_step": 6,
+                "registry_no": registry_no,
+                "csv": csv,
+                "files": {k: str(v) if v else None for k, v in files.items()},
+                "downloads": {k: str(v) for k, v in downloads.items()},
+                "upload_summary": upload_summary,
+            }
+        except UncertainSubmission:
+            raise
+        except Exception as e:
+            raise UncertainSubmission(
+                f"ctbg_firma_sin_confirmar: {e}",
+                markers={},
+            ) from e
 
 
 async def _navigate_authenticated(page, url: str, console) -> None:

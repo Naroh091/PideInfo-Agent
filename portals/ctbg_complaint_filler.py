@@ -10,6 +10,8 @@ import re
 from pathlib import Path
 from typing import Optional
 
+from tasks._submission import UncertainSubmission
+
 from playwright.async_api import (
     FrameLocator,
     Page,
@@ -232,8 +234,17 @@ class CtbgComplaintFiller:
         await self.page.locator(
             'button[name="viewFolderAdmissible:confirm"]'
         ).click()
-        await self.page.wait_for_load_state("domcontentloaded")
-        await self._wait_for_step("6")
+        # ── PUNTO DE NO RETORNO: la firma CTBG se ha enviado ──
+        try:
+            await self.page.wait_for_load_state("domcontentloaded")
+            await self._wait_for_step("6")
+        except UncertainSubmission:
+            raise
+        except Exception as e:
+            raise UncertainSubmission(
+                f"ctbg_firma_sin_confirmar: {e}",
+                markers={},
+            ) from e
 
     async def _step6_acuse(self) -> dict:
         """Extract the registry number/CSV and download the two PDFs.
