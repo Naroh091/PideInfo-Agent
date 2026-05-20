@@ -350,22 +350,68 @@ async def _step2_submit_capture_id_borr(page, console) -> Optional[str]:
     """Click "Siguiente" and wait for the URL to flip to /procedimiento/firma
     with ?idBorr=…. The portal mints the borrador on this transition.
 
-    The mint involves a server round-trip with a spinner — observed up to
-    ~40s in the wild — so the wait is generous. A real validation error
-    leaves the URL on /procedimiento/formulario; only collect errors after
-    the wait actually times out.
+    The mint is a server round-trip behind an "Estamos procesando tu
+    solicitud…" spinner that can run for minutes under load — a fixed
+    timeout is the wrong tool. Instead we poll: as long as that spinner is
+    up the portal is still working, so we keep waiting (up to a hard cap);
+    only once the spinner clears WITHOUT reaching /firma do we treat it as a
+    real failure and read the (visible) validation errors.
     """
-    await _click_dnt_button(page, "Siguiente")
-    try:
-        await page.wait_for_url("**/procedimiento/firma?**", timeout=180_000)
-    except Exception:
-        # Maybe validation errors on step 2.
-        errors = await _collect_validation_errors(page)
-        if errors:
-            raise RuntimeError("step2_validation: " + "; ".join(errors[:6]))
-        raise
+    # Hard ceiling for the borrador mint. Overridable without a rebuild via
+    # PT_STEP2_MINT_TIMEOUT_S — handy while we still don't know the portal's
+    # real worst case.
+    overall_cap_s = int(os.getenv("PT_STEP2_MINT_TIMEOUT_S", "360"))
+    chunk_ms = 20_000
 
-    return _extract_query_param(page.url, "idBorr")
+    await _click_dnt_button(page, "Siguiente")
+
+    waited = 0
+    while True:
+        try:
+            await page.wait_for_url("**/procedimiento/firma?**", timeout=chunk_ms)
+            return _extract_query_param(page.url, "idBorr")
+        except Exception:
+            waited += chunk_ms // 1000
+            if await _portal_is_processing(page):
+                if waited >= overall_cap_s:
+                    raise RuntimeError(
+                        f"step2_portal_timeout: el portal lleva {waited}s en "
+                        "'Estamos procesando tu solicitud' sin emitir el borrador"
+                    )
+                console.print(f"[dim]Portal procesando el envío… ({waited}s)[/]")
+                continue
+            # Spinner gone and still not on /firma → genuine step-2 failure.
+            errors = await _collect_validation_errors(page)
+            if errors:
+                raise RuntimeError("step2_validation: " + "; ".join(errors[:6]))
+            raise RuntimeError(
+                "step2_did_not_advance: el portal dejó de procesar sin avanzar "
+                f"a la firma (URL: {page.url})"
+            )
+
+
+async def _portal_is_processing(page) -> bool:
+    """True while the portal shows its "Estamos procesando tu solicitud…"
+    overlay — a visible `dnt-spinner` or that text both count. Used to tell a
+    slow-but-working mint apart from a stalled one."""
+    try:
+        return await page.evaluate(
+            """() => {
+                const visible = (el) => {
+                    if (!el) return false;
+                    const cs = getComputedStyle(el);
+                    if (cs.display === 'none' || cs.visibility === 'hidden') return false;
+                    const r = el.getBoundingClientRect();
+                    return r.width > 0 && r.height > 0;
+                };
+                for (const sp of document.querySelectorAll('dnt-spinner')) {
+                    if (visible(sp)) return true;
+                }
+                return /procesando tu solicitud/i.test(document.body.innerText || '');
+            }"""
+        )
+    except Exception:
+        return False
 
 
 async def _step3_sign(page, console) -> None:
@@ -450,7 +496,7 @@ async def _step3_sign(page, console) -> None:
     try:
         await page.wait_for_url(
             lambda url: "/procedimiento/firma" not in url,
-            timeout=120_000,
+            timeout=360_000,
         )
     except Exception as e:
         raise RuntimeError(
@@ -751,13 +797,25 @@ async def _is_step_active(page, step_index: int) -> bool:
 
 
 async def _collect_validation_errors(page) -> list[str]:
-    """Pull error messages exposed by dnt-* components after a failed
-    "Siguiente". Stencil components typically expose `error` as a property
-    and render the message inside their shadow root."""
+    """Pull error messages from dnt-* components that are actually VISIBLE.
+
+    The wizard keeps all three steps in the DOM (toggling visibility), and a
+    Stencil component can retain a stale `.error` property from an earlier
+    pass. Scanning blindly yields false positives — e.g. a "formato no
+    válido" scraped off a hidden field while the real problem is elsewhere.
+    Restricting to visible elements keeps the report trustworthy."""
     return await page.evaluate(
         """() => {
+            const visible = (el) => {
+                const cs = getComputedStyle(el);
+                if (cs.display === 'none' || cs.visibility === 'hidden') return false;
+                if (el.offsetParent === null && cs.position !== 'fixed') return false;
+                const r = el.getBoundingClientRect();
+                return r.width > 0 && r.height > 0;
+            };
             const out = [];
             for (const el of document.querySelectorAll('dnt-input,dnt-textarea,dnt-select,dnt-radio-group,dnt-checkbox-group')) {
+                if (!visible(el)) continue;
                 const err = el.error || (el.errorMessage || '');
                 if (typeof err === 'string' && err.trim() !== '') {
                     const label = (el.label || '').trim();
