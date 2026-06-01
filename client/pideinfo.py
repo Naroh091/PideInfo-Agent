@@ -61,6 +61,21 @@ def _refuse_invalid_pdf(filenames: list[str], source: str) -> None:
     raise InvalidPdfError(msg)
 
 
+def _created_count(result: dict) -> int:
+    """Number of documents the backend reports as newly stored.
+
+    The webhook response shape depends on the source: legacy sources
+    (``transparencia_age``, ``redsara_rec``…) return ``created`` as an int,
+    while ``consejo_ctbg`` returns a list of per-document dicts since the
+    batched-reconciliation rework. Comparing a list against an int raises
+    TypeError, so every caller must go through this helper.
+    """
+    created = result.get("created", 0)
+    if isinstance(created, list):
+        return len(created)
+    return int(created or 0)
+
+
 class PideInfoClient:
     """Client for posting synced documents to PideInfo via JWT-authenticated API."""
 
@@ -255,9 +270,10 @@ class PideInfoClient:
             response.raise_for_status()
             result = response.json()
 
-        if result.get("created", 0) > 0:
+        created_count = _created_count(result)
+        if created_count > 0:
             console.print(
-                f"[green]CTBG: subidos {result['created']} doc(s) de la reclamación {registry_no}[/]"
+                f"[green]CTBG: subidos {created_count} doc(s) de la reclamación {registry_no}[/]"
             )
         for skipped in result.get("skipped", []):
             console.print(
@@ -540,7 +556,7 @@ class PideInfoClient:
             response.raise_for_status()
             result = response.json()
 
-        if result.get("created", 0) > 0:
+        if _created_count(result) > 0:
             console.print(f"[green]Sincronizado: {filename} → PideInfo[/]")
         for skipped in result.get("skipped", []):
             console.print(f"[yellow]Saltado: {skipped['filename']} ({skipped['reason']})[/]")
@@ -571,6 +587,11 @@ class PideInfoClient:
         Per-doc fields (``complaint_phase``, ``csv``, ``documentTitle``)
         travel in each document's ``metadata`` block; expediente-level fields
         stay at the top level.
+
+        The backend caps webhook payloads at 50 MB, so oversized batches are
+        split into chunks. The anchor-first ordering guarantees the first
+        chunk carries the hash-matchable docs: once it promotes
+        ``externalId``, later chunks resolve by plain reference match.
         """
         if not docs:
             return {"created": [], "skipped": []}
@@ -614,45 +635,78 @@ class PideInfoClient:
         if invalid:
             _refuse_invalid_pdf(invalid, source=f"CTBG expediente {expediente.numero}")
 
-        payload = {
-            "source": "consejo_ctbg",
-            "expedienteRef": expediente.numero,
-            "documents": documents_payload,
-            "metadata": {
-                "expedienteEstado": expediente.estado,
-                "expedienteTitulo": expediente.titulo,
-                "fechaApertura": expediente.fecha_apertura,
-                "fechaCierre": expediente.fecha_cierre,
-            },
+        # Stay well below the backend's 50 MB cap: chunk on accumulated
+        # base64 size. A single doc above the cap still goes alone in its
+        # own chunk (the backend rejects it with 413, surfaced as an error).
+        max_chunk_bytes = 45 * 1024 * 1024
+        chunks: list[list[dict]] = []
+        current: list[dict] = []
+        current_size = 0
+        for entry in documents_payload:
+            entry_size = len(entry["content"])
+            if current and current_size + entry_size > max_chunk_bytes:
+                chunks.append(current)
+                current = []
+                current_size = 0
+            current.append(entry)
+            current_size += entry_size
+        if current:
+            chunks.append(current)
+
+        body_metadata = {
+            "expedienteEstado": expediente.estado,
+            "expedienteTitulo": expediente.titulo,
+            "fechaApertura": expediente.fecha_apertura,
+            "fechaCierre": expediente.fecha_cierre,
         }
 
+        merged: dict = {"created": [], "skipped": [], "documents": 0}
         async with httpx.AsyncClient(timeout=300) as client:
-            response = await client.post(
-                self._webhook_url,
-                json=payload,
-                headers={
-                    **self._auth_headers,
-                    "Content-Type": "application/json",
-                },
-            )
-            response.raise_for_status()
-            result = response.json()
+            for chunk in chunks:
+                payload = {
+                    "source": "consejo_ctbg",
+                    "expedienteRef": expediente.numero,
+                    "documents": chunk,
+                    "metadata": body_metadata,
+                }
+                response = await client.post(
+                    self._webhook_url,
+                    json=payload,
+                    headers={
+                        **self._auth_headers,
+                        "Content-Type": "application/json",
+                    },
+                )
+                response.raise_for_status()
+                result = response.json()
 
-        created = result.get("created")
-        if isinstance(created, list):
-            for item in created:
-                console.print(f"[green]CTBG: {item.get('filename', '?')} → PideInfo[/]")
-        elif isinstance(created, int) and created > 0:
-            console.print(
-                f"[green]CTBG {expediente.numero}: {created} doc(s) → PideInfo[/]"
-            )
-        for s in result.get("skipped") or []:
-            retry_hint = " [reintentable]" if s.get("retryable") else ""
-            reason = s.get("reason") or s.get("code") or "?"
-            console.print(
-                f"[dim]CTBG saltado: {s.get('filename', '?')} ({reason}){retry_hint}[/]"
-            )
-        return result
+                merged["documents"] += result.get("documents", len(chunk))
+                created = result.get("created")
+                if isinstance(created, list):
+                    merged["created"].extend(created)
+                    for item in created:
+                        console.print(f"[green]CTBG: {item.get('filename', '?')} → PideInfo[/]")
+                elif isinstance(created, int):
+                    # Legacy backend: keep the int semantics by accumulating
+                    # counts; merged["created"] stays a list only if every
+                    # chunk returned a list.
+                    if isinstance(merged["created"], list) and not merged["created"]:
+                        merged["created"] = 0
+                    if isinstance(merged["created"], int):
+                        merged["created"] += created
+                    if created > 0:
+                        console.print(
+                            f"[green]CTBG {expediente.numero}: {created} doc(s) → PideInfo[/]"
+                        )
+                skipped_items = result.get("skipped") or []
+                merged["skipped"].extend(skipped_items)
+                for s in skipped_items:
+                    retry_hint = " [reintentable]" if s.get("retryable") else ""
+                    reason = s.get("reason") or s.get("code") or "?"
+                    console.print(
+                        f"[dim]CTBG saltado: {s.get('filename', '?')} ({reason}){retry_hint}[/]"
+                    )
+        return merged
 
     async def report_consejo_pending_notifications(
         self,
