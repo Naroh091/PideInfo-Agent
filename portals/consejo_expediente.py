@@ -29,6 +29,7 @@ truststore.inject_into_ssl()
 
 from auth.session_manager import SessionExpiredError
 from models.consejo_expediente import DocumentoCTBGExpediente, ExpedienteCTBG
+from runtime import FIREFOX_LAUNCH_ARGS
 
 console = Console()
 
@@ -87,6 +88,7 @@ class ConsejoExpedienteScraper:
         self._context = await self._pw.firefox.launch_persistent_context(
             user_data_dir=str(self.firefox_profile_dir),
             headless=headless,
+            args=FIREFOX_LAUNCH_ARGS,
             firefox_user_prefs=firefox_user_prefs,
             locale="es-ES",
             ignore_https_errors=True,

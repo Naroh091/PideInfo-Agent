@@ -14,6 +14,18 @@ from rich.console import Console
 
 console = Console()
 
+# Args passed to every Firefox launch (launch_persistent_context).
+#
+# --allow-downgrade: the user's persistent profiles
+# (~/.pideinfo-agent/firefox-profile-*) outlive every agent update, but each
+# agent release ships whatever Firefox build its bundled Playwright requires.
+# If a release (or a reinstall/dev venv) carries an OLDER Firefox than the one
+# that last touched the profile, Firefox's downgrade protection aborts at
+# startup and Playwright only reports "failed to launch the browser process".
+# These profiles only hold certificates and cookies (stable schemas), so
+# allowing the downgrade is safe — and far better than a dead agent.
+FIREFOX_LAUNCH_ARGS = ["--allow-downgrade"]
+
 
 def is_frozen() -> bool:
     """Return True if running inside a PyInstaller bundle."""
