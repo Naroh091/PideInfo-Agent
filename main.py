@@ -1144,6 +1144,15 @@ def main() -> None:
         help="Scrapear pero no sincronizar con PideInfo",
     )
     parser.add_argument(
+        "--ctbg-resync",
+        action="store_true",
+        help=(
+            "Olvidar qué documentos CTBG ya se sincronizaron y reenviarlos todos "
+            "en el próximo ciclo. Seguro: el backend deduplica por hash. Útil para "
+            "re-vincular expedientes que quedaron sin asociar a su reclamación."
+        ),
+    )
+    parser.add_argument(
         "--tray",
         action="store_true",
         help="Ejecutar como icono en la barra del sistema",
@@ -1269,6 +1278,21 @@ def main() -> None:
 
     _drain_pending_tasks_safe()
     # ──────────────────────────────────────────────────────────────────────
+
+    if args.ctbg_resync:
+        # Forget which CTBG documents were already synced so the next crawl
+        # re-sends every expediente. The backend dedups by contentHash, so
+        # already-stored docs come back as non-retryable "duplicate" skips —
+        # but the re-send gives the hash reconciler a fresh chance to link
+        # expedientes that never got associated with their complaint.
+        state = load_state(settings.state_file)
+        cleared = len(state.ctbg_synced_csvs)
+        state.ctbg_synced_csvs.clear()
+        save_state(state, settings.state_file)
+        console.print(
+            f"[yellow]CTBG resync: olvidados {cleared} documento(s) sincronizado(s); "
+            "se reenviarán en el próximo ciclo[/]"
+        )
 
     if args.auth_only:
         asyncio.run(do_auth(settings))
