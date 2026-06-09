@@ -7,6 +7,8 @@ from typing import Any
 from playwright.async_api import async_playwright
 from rich.console import Console
 
+from runtime import FIREFOX_LAUNCH_ARGS
+
 console = Console()
 
 
@@ -98,6 +100,7 @@ async def authenticate(
     async with async_playwright() as p:
         launch_kwargs: dict[str, Any] = dict(
             headless=headless,
+            args=FIREFOX_LAUNCH_ARGS,
             firefox_user_prefs=firefox_user_prefs,
             locale="es-ES",
             # Spanish government portals use CAs (FNMT, etc.) not always in

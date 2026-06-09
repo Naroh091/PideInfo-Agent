@@ -518,7 +518,15 @@ async def _sync_consejo_expedientes(
 
             for exp in expedientes:
                 try:
-                    docs = await scraper.iter_documents(exp)
+                    # Listing + immediate download in one pass: Wicket download
+                    # URLs are page-state-scoped and go stale as soon as the
+                    # crawl navigates to another phase, so iter_documents
+                    # downloads each new doc while its phase view is open.
+                    results = await scraper.iter_documents(
+                        exp,
+                        skip_csvs=state.ctbg_synced_csvs,
+                        download_dir=None if dry_run else downloads.downloads_dir,
+                    )
                 except SessionExpiredError:
                     console.print(
                         "[yellow]CTBG expedientes: sesión expirada, abortando crawl[/]"
@@ -530,38 +538,38 @@ async def _sync_consejo_expedientes(
                     )
                     continue
 
-                new_docs = [d for d in docs if d.csv and d.csv not in state.ctbg_synced_csvs]
-                if not new_docs:
+                new_results = [
+                    (d, path)
+                    for d, path in results
+                    if d.csv and d.csv not in state.ctbg_synced_csvs
+                ]
+                if not new_results:
                     continue
 
                 console.print(
-                    f"[bold]CTBG {exp.numero}: {len(new_docs)} documento(s) nuevo(s) "
-                    f"({len(docs)} en total)[/]"
+                    f"[bold]CTBG {exp.numero}: {len(new_results)} documento(s) nuevo(s) "
+                    f"({len(results)} en total)[/]"
                 )
 
                 if dry_run:
-                    for d in new_docs:
+                    for d, _path in new_results:
                         console.print(
                             f"  [dim]• [{d.phase}] {d.title} (CSV: {d.csv})[/]"
                         )
                     continue
 
-                # Download all new docs of the expediente, then upload as one
-                # batch so the backend can promote ``externalId`` via hash on
-                # our solicitud and resolve the Consejo-generated phases in
-                # the same request (otherwise non-original docs land before
-                # the promotion and force a second crawl to retry them).
-                batch: list[tuple[DocumentoCTBGExpediente, Path]] = []
-                for d in new_docs:
-                    safe_csv = d.csv or f"unknown-{abs(hash(d.title)) & 0xFFFFFF:06x}"
-                    dest = downloads.downloads_dir / f"ctbg_{exp.numero.replace('/', '-')}_{safe_csv}.pdf"
-                    try:
-                        console.print(f"[dim]CTBG descargando [{d.phase}] {d.title}...[/]")
-                        await scraper.download(d, dest)
-                        batch.append((d, dest))
-                    except Exception as e:
+                # Upload as one batch so the backend can promote ``externalId``
+                # via hash on our solicitud and resolve the Consejo-generated
+                # phases in the same request. Docs whose download failed stay
+                # out of the batch and out of the synced set → retried next
+                # cycle.
+                batch: list[tuple[DocumentoCTBGExpediente, Path]] = [
+                    (d, path) for d, path in new_results if path is not None
+                ]
+                for d, path in new_results:
+                    if path is None:
                         console.print(
-                            f"[red]CTBG: error descargando {d.title}: {e}[/]"
+                            f"[yellow]CTBG: {d.title} sin descargar — se reintentará[/]"
                         )
 
                 if not batch:

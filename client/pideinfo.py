@@ -45,11 +45,11 @@ def _is_valid_pdf(path: Path) -> bool:
         return False
 
 
-def _refuse_invalid_pdf(filenames: list[str], source: str) -> None:
-    """Emit a desktop notification and raise InvalidPdfError.
+def _warn_invalid_pdf(filenames: list[str], source: str) -> str:
+    """Console + desktop warning about invalid PDFs. Returns the message.
 
-    Logs to console too. The notifier import is local so a failure to load
-    pystray/Pillow on a slim install doesn't take down the upload path."""
+    The notifier import is local so a failure to load pystray/Pillow on a
+    slim install doesn't take down the upload path."""
     label = ", ".join(filenames) if filenames else "documento desconocido"
     msg = f"{source}: {label} no es un PDF válido — se reintentará"
     console.print(f"[yellow]{msg}[/]")
@@ -58,7 +58,12 @@ def _refuse_invalid_pdf(filenames: list[str], source: str) -> None:
         notify_error(msg)
     except Exception:
         pass
-    raise InvalidPdfError(msg)
+    return msg
+
+
+def _refuse_invalid_pdf(filenames: list[str], source: str) -> None:
+    """Emit a desktop notification and raise InvalidPdfError."""
+    raise InvalidPdfError(_warn_invalid_pdf(filenames, source))
 
 
 def _created_count(result: dict) -> int:
@@ -609,6 +614,7 @@ class PideInfoClient:
         )
 
         invalid: list[str] = []
+        invalid_skips: list[dict] = []
         documents_payload: list[dict] = []
         for doc, path in sorted_docs:
             suffix = path.suffix or ".pdf"
@@ -616,7 +622,19 @@ class PideInfoClient:
             safe_title = doc.title.replace("/", "-")
             filename = f"{safe_title}{suffix}"
             if not _is_valid_pdf(path):
+                # Don't abort the whole batch over one bad download (the sede
+                # sometimes serves an HTML error page instead of the PDF):
+                # surface it as a retryable skip so the caller leaves its CSV
+                # unsynced and retries next cycle, while the rest of the
+                # expediente still syncs.
                 invalid.append(filename)
+                invalid_skips.append({
+                    "filename": filename,
+                    "csv": doc.csv,
+                    "code": "invalid_pdf",
+                    "retryable": True,
+                    "reason": "no es un PDF válido (la sede devolvió HTML/error)",
+                })
                 continue
             content = path.read_bytes()
             documents_payload.append({
@@ -633,7 +651,10 @@ class PideInfoClient:
             })
 
         if invalid:
-            _refuse_invalid_pdf(invalid, source=f"CTBG expediente {expediente.numero}")
+            _warn_invalid_pdf(invalid, source=f"CTBG expediente {expediente.numero}")
+
+        if not documents_payload:
+            return {"created": [], "skipped": invalid_skips, "documents": 0}
 
         # Stay well below the backend's 50 MB cap: chunk on accumulated
         # base64 size. A single doc above the cap still goes alone in its
@@ -660,7 +681,9 @@ class PideInfoClient:
             "fechaCierre": expediente.fecha_cierre,
         }
 
-        merged: dict = {"created": [], "skipped": [], "documents": 0}
+        # Invalid-PDF skips ride along in the response shape so the caller's
+        # retryable bookkeeping treats them like backend skips.
+        merged: dict = {"created": [], "skipped": list(invalid_skips), "documents": 0}
         async with httpx.AsyncClient(timeout=300) as client:
             for chunk in chunks:
                 payload = {

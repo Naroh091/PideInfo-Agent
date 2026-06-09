@@ -8,6 +8,7 @@ it with a persistent Playwright context.
 """
 from __future__ import annotations
 
+import hashlib
 import re
 from pathlib import Path
 from typing import Optional
@@ -29,10 +30,12 @@ truststore.inject_into_ssl()
 
 from auth.session_manager import SessionExpiredError
 from models.consejo_expediente import DocumentoCTBGExpediente, ExpedienteCTBG
+from runtime import FIREFOX_LAUNCH_ARGS
 
 console = Console()
 
-_CSV_RE = re.compile(r"CSV:\s*([A-Z0-9]+)")
+# Tolerant to markup like "<span>CSV</span>: XXX" (space before the colon).
+_CSV_RE = re.compile(r"CSV\s*:\s*([A-Z0-9]+)")
 
 
 class ConsejoExpedienteScraper:
@@ -87,6 +90,7 @@ class ConsejoExpedienteScraper:
         self._context = await self._pw.firefox.launch_persistent_context(
             user_data_dir=str(self.firefox_profile_dir),
             headless=headless,
+            args=FIREFOX_LAUNCH_ARGS,
             firefox_user_prefs=firefox_user_prefs,
             locale="es-ES",
             ignore_https_errors=True,
@@ -160,9 +164,25 @@ class ConsejoExpedienteScraper:
     # ------------------------------------------------------------------
 
     async def iter_documents(
-        self, exp: ExpedienteCTBG
-    ) -> list[DocumentoCTBGExpediente]:
-        """Open every phase of an expediente and return all card descriptors."""
+        self,
+        exp: ExpedienteCTBG,
+        skip_csvs: set[str] | None = None,
+        download_dir: Path | None = None,
+    ) -> list[tuple[DocumentoCTBGExpediente, Path | None]]:
+        """Open every phase of an expediente and return all card descriptors.
+
+        When ``download_dir`` is given, every document whose key is not in
+        ``skip_csvs`` is downloaded IMMEDIATELY, while its phase view is still
+        open. Wicket download URLs are page-state-scoped: as soon as we
+        navigate to another phase (or expediente) the server invalidates them
+        and serves HTTP 500 or an HTML error page instead of the PDF —
+        deferred downloads are not an option.
+
+        Returns ``(doc, path)`` tuples; ``path`` is ``None`` when the doc was
+        skipped (already synced), no ``download_dir`` was given (dry-run), or
+        its download failed (caller should retry next cycle).
+        """
+        skip_csvs = skip_csvs or set()
         page = self._require_page()
         await self._navigate_authenticated(page, exp.detail_href)
 
@@ -173,7 +193,7 @@ class ConsejoExpedienteScraper:
             "els => els.map(a => a.innerText.trim()).filter(t => t.length > 0)",
         )
 
-        out: list[DocumentoCTBGExpediente] = []
+        out: list[tuple[DocumentoCTBGExpediente, Path | None]] = []
         for label in phase_labels:
             try:
                 await self._open_phase(page, label)
@@ -194,17 +214,48 @@ class ConsejoExpedienteScraper:
                 title = (card.get("title") or "").strip()
                 href = (card.get("href") or "").strip()
                 text = card.get("text") or ""
-                if not title or not href:
+                # The detail view renders the phase tiles themselves as
+                # .c-card__content whose only link is the phase navigation
+                # anchor (href="#"). Real document cards always carry a
+                # Wicket download URL.
+                if not title or not href or href == "#":
                     continue
                 csv_match = _CSV_RE.search(text)
                 csv = csv_match.group(1) if csv_match else ""
-                out.append(DocumentoCTBGExpediente(
+                if not csv:
+                    # User-attached docs (solicitud, acuse) and CTBG
+                    # communications carry no CSV in their card. Derive a
+                    # stable surrogate from expediente + phase + title so
+                    # they still pass the "new docs" filter and dedup
+                    # bookkeeping (Wicket hrefs are session-scoped, so they
+                    # can't be the key).
+                    digest = hashlib.sha1(
+                        f"{exp.numero}|{label}|{title}".encode("utf-8")
+                    ).hexdigest()[:20].upper()
+                    csv = f"NOCSV-{digest}"
+                doc = DocumentoCTBGExpediente(
                     expediente_ref=exp.numero,
                     phase=label,
                     title=title,
                     csv=csv,
                     descarga_href=urljoin(page.url, href),
-                ))
+                )
+
+                dest: Path | None = None
+                if download_dir is not None and doc.csv not in skip_csvs:
+                    dest = download_dir / (
+                        f"ctbg_{exp.numero.replace('/', '-')}_{doc.csv}.pdf"
+                    )
+                    try:
+                        console.print(f"[dim]CTBG descargando [{label}] {title}...[/]")
+                        await self._download_fresh(doc, dest)
+                    except Exception as e:
+                        console.print(
+                            f"[red]CTBG: descarga falló para {title}: {str(e)[:200]}[/]"
+                        )
+                        dest = None
+
+                out.append((doc, dest))
 
             await self._safe_back_to_detail(page, exp)
 
@@ -214,18 +265,22 @@ class ConsejoExpedienteScraper:
     # Download
     # ------------------------------------------------------------------
 
-    async def download(self, doc: DocumentoCTBGExpediente, dest: Path) -> Path:
-        """Download the PDF behind a card's Descargar link."""
+    async def _download_fresh(self, doc: DocumentoCTBGExpediente, dest: Path) -> Path:
+        """Download a card's PDF while its Wicket URL is still fresh.
+
+        Must be called while the phase view that rendered ``doc`` is still
+        the current page — see ``iter_documents``.
+        """
         if self._context is None:
             raise RuntimeError("scraper not entered")
         dest.parent.mkdir(parents=True, exist_ok=True)
         response = await self._context.request.get(doc.descarga_href)
+        body = await response.body()
         if response.status >= 400:
-            body = (await response.text())[:500]
             raise RuntimeError(
-                f"CTBG: descarga falló {response.status} para {doc.title}: {body}"
+                f"HTTP {response.status} para {doc.title}: {body[:200]!r}"
             )
-        dest.write_bytes(await response.body())
+        dest.write_bytes(body)
         return dest
 
     # ------------------------------------------------------------------
@@ -294,9 +349,12 @@ class ConsejoExpedienteScraper:
         # `:has-text` does substring match — escape backslashes / quotes by
         # using JS-passed text via JSON to avoid Playwright selector parsing.
         await page.locator("a.singleActionLink.exp", has_text=label).first.click()
-        await page.wait_for_selector(
-            ".c-card__content, a.singleActionLink.goback", timeout=15_000
-        )
+        # Don't wait on .c-card__content: the detail view ALSO renders the
+        # phase tiles as cards, so that selector resolves before the Wicket
+        # re-render and we'd scrape the stale page. The goback link only
+        # exists inside a phase view — it arrives in the same Ajax response
+        # as the document cards, so it's the reliable "phase loaded" signal.
+        await page.wait_for_selector("a.singleActionLink.goback", timeout=15_000)
 
     async def _safe_back_to_detail(self, page: Page, exp: ExpedienteCTBG) -> None:
         try:

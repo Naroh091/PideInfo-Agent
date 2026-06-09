@@ -1,4 +1,8 @@
-playwright>=1.40
+# Pinned exactly: each Playwright release requires a specific Firefox build,
+# and the user's persistent Firefox profiles outlive agent updates. A loose
+# range lets two installs of the same agent version resolve to different
+# Firefox versions (and downgrades trip Firefox's profile protection).
+playwright==1.60.0
 httpx>=0.27
 apscheduler>=3.10,<4
 python-dotenv>=1.0

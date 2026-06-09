@@ -13,6 +13,8 @@ from typing import Any
 from playwright.async_api import async_playwright
 from rich.console import Console
 
+from runtime import FIREFOX_LAUNCH_ARGS
+
 console = Console()
 
 _API_DOMAIN = "redsara.es"  # catch any subdomain, including auth server refresh calls
@@ -60,6 +62,7 @@ async def authenticate_redsara(
         context = await p.firefox.launch_persistent_context(
             user_data_dir=str(firefox_profile_dir),
             headless=headless,
+            args=FIREFOX_LAUNCH_ARGS,
             firefox_user_prefs=firefox_user_prefs,
             locale="es-ES",
             ignore_https_errors=True,

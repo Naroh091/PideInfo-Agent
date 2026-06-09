@@ -30,6 +30,7 @@ import re
 from pathlib import Path
 from typing import Any, Optional
 
+from runtime import FIREFOX_LAUNCH_ARGS
 from tasks._submission import UncertainSubmission
 
 logger = logging.getLogger(__name__)
@@ -147,6 +148,7 @@ async def _drive(
         context = await p.firefox.launch_persistent_context(
             user_data_dir=str(profile_dir),
             headless=headless,
+            args=FIREFOX_LAUNCH_ARGS,
             firefox_user_prefs=firefox_user_prefs,
             locale="es-ES",
             ignore_https_errors=True,
