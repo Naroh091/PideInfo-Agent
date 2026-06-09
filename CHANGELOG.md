@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.9.0](https://github.com/Naroh091/PideInfo-Agent/compare/v0.8.0...v0.9.0) (2026-06-09)
+
+
+### Features
+
+* re-link CTBG expedientes by document hash ([68cd583](https://github.com/Naroh091/PideInfo-Agent/commit/68cd583e80c1bc2f690aca62152924bea7ec81a2))
+* re-link CTBG expedientes by document hash ([68cd583](https://github.com/Naroh091/PideInfo-Agent/commit/68cd583e80c1bc2f690aca62152924bea7ec81a2))
+* re-link CTBG expedientes by document hash ([e23d75a](https://github.com/Naroh091/PideInfo-Agent/commit/e23d75ab351d747e0589e2a8462a49e45062c1d4))
+
+
+### Bug Fixes
+
+* ctbg hash sync ([df5130a](https://github.com/Naroh091/PideInfo-Agent/commit/df5130ae2e7664da4050e7516ee90ea2630b8b01))
+* inmediate download of CTBG PDF files ([35eede7](https://github.com/Naroh091/PideInfo-Agent/commit/35eede7c415b941eaa4d5d669aaee6370577882c))
+
 ## [0.8.0](https://github.com/Naroh091/PideInfo-Agent/compare/v0.7.6...v0.8.0) (2026-05-20)
 
 
