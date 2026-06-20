@@ -65,7 +65,11 @@ class CtbgComplaintFiller:
         complaint_reason (4 literales o None — pre-derivado por el backend;
             fallback si no llega `resolution_result`),
         notification_date (dd/mm/yyyy or None),
-        complaint_body (full text), request_external_id
+        complaint_body (full text), request_external_id,
+        autonomous_local_entity (value del desplegable "Comunidad Autónoma" del
+            formulario regional del CTBG, p.ej. 'principado_asturias'; None o
+            ausente en el trámite estatal — su presencia activa el paso CCAA
+            del paso 2 y solo toma uno de los 7 values soportados por el portal)
 
     `files`:
         reclamacion: Path  – PDF of the complaint argument (always)
@@ -145,14 +149,34 @@ class CtbgComplaintFiller:
             label_re=re.compile(r"ENTIDAD RECLAMADA", re.I),
             value=self.payload["public_body_name"] or "",
         )
-        # Wicket label has appeared as both "Nº expediente del Portal de
-        # Transparencia" and "Indique el nº expediente del Portal de
-        # Transparencia" — match the invariant substring with a tolerant gap
-        # in case of additional articles ("del Portal **de la** Transparencia").
-        await self._wicket_write(
-            label_re=re.compile(r"expediente.{0,20}Portal.{0,20}Transparencia", re.I),
-            value=self.payload["request_external_id"] or "",
-        )
+
+        # Vía autonómica/local: el formulario regional añade un desplegable
+        # "Comunidad Autónoma" (obligatorio) que no existe en el estatal. El
+        # backend manda el value del portal en `autonomous_local_entity` solo
+        # para ese trámite; en el estatal la clave es None/ausente → se omite.
+        # Seleccionamos por value (enum estable del portal: principado_asturias,
+        # cantabria, …), no por la etiqueta visible (sensible a idioma/acentos).
+        ccaa_value = self.payload.get("autonomous_local_entity")
+        if ccaa_value:
+            await self._wicket_select(
+                label_re=re.compile(r"Comunidad Aut.noma", re.I),
+                option_value=ccaa_value,
+            )
+
+        # Nº de expediente. La etiqueta varía entre trámites:
+        #   estatal:  "(Indique el) Nº expediente del Portal de Transparencia"
+        #             — obligatorio.
+        #   regional: "En su caso, Nº expediente de la solicitud que origina
+        #             esta reclamación" — opcional.
+        # Matcheamos la parte invariante ("Nº expediente") y solo lo rellenamos
+        # si tenemos identificador: en silencio autonómico/local puede no haber
+        # expediente y el campo es opcional, así que no forzamos su escritura.
+        external_id = self.payload.get("request_external_id")
+        if external_id:
+            await self._wicket_write(
+                label_re=re.compile(r"N.{0,3}\s*expediente", re.I),
+                value=external_id,
+            )
 
         # B. RESPUESTA A SU SOLICITUD — derivar branch y razón del valor tipado
         # `resolution_result` (preferente), con fallback a los campos
@@ -195,17 +219,34 @@ class CtbgComplaintFiller:
     async def _step3_documents(self) -> None:
         await self._wait_for_step("3")
 
+        is_regional = bool(self.payload.get("autonomous_local_entity"))
         branch = self._resolve_branch()
-        if branch == "yes":
-            # Card 0: Resolución frente a la que se reclama
-            await self._attach_required_doc(0, self.files["respuesta"])
-            # Card 1: Notificación de la resolución
-            await self._attach_required_doc(1, self.files["notificacion"])
-            # Card 2: Solicitud de información
-            await self._attach_required_doc(2, self.files["solicitud"])
-        else:
-            # Single card: Solicitud de información
+
+        if is_regional:
+            # Formulario autonómico/local: siempre 1 sola card obligatoria
+            # ("Solicitud de información"), independientemente de la rama.
+            # El formulario regional NO pide resolución/notificación como docs
+            # obligatorios — solo la solicitud original. Si disponemos de la
+            # respuesta/notificación las subimos como documentación adicional.
             await self._attach_required_doc(0, self.files["solicitud"])
+            for label, key in [
+                ("Resolución / respuesta de la administración", "respuesta"),
+                ("Notificación de la resolución", "notificacion"),
+            ]:
+                if self.files.get(key):
+                    await self._add_additional_doc(self.files[key], description=label)
+        else:
+            # Formulario estatal: 3 cards obligatorias si hay respuesta, 1 si silencio.
+            if branch == "yes":
+                # Card 0: Resolución frente a la que se reclama
+                await self._attach_required_doc(0, self.files["respuesta"])
+                # Card 1: Notificación de la resolución
+                await self._attach_required_doc(1, self.files["notificacion"])
+                # Card 2: Solicitud de información
+                await self._attach_required_doc(2, self.files["solicitud"])
+            else:
+                # Single card: Solicitud de información
+                await self._attach_required_doc(0, self.files["solicitud"])
 
         # No subimos el PDF de la reclamación como adicional: su texto ya va
         # en el campo "Exponga brevemente los motivos" del paso 2.
@@ -355,8 +396,18 @@ class CtbgComplaintFiller:
 
         The label sits as a text node inside the `<p>` *grandparent* of the
         anchor — `el.parentElement` is the wrapping `<span>`, whose innerText
-        is just "Escribir". We walk up a few levels and return the first
-        ancestor whose innerText (minus the link's own text) is non-empty.
+        is just "Escribir".
+
+        We reconstruct the label as the text that appears **before** the anchor
+        within its nearest block (a Range from block-start to the anchor). This
+        is field-specific: when several fields share one `<p>` (the autonómico/
+        local form packs ENTIDAD + "Comunidad Autónoma" + Nº expediente into a
+        single `<p>`), the plain ancestor innerText bleeds a field's label into
+        its siblings, which would make `/Comunidad Autónoma/` also match the
+        ENTIDAD anchor. Preceding-only text can't bleed *backwards*, so matching
+        the first anchor in DOM order whose preceding text hits the regex always
+        lands on the field right after that label. Falls back to the old
+        ancestor walk when there is no preceding text.
 
         Retries up to 3 times because Wicket can finish rendering after our
         idle wait completes.
@@ -372,6 +423,21 @@ class CtbgComplaintFiller:
                 label = await a.evaluate(
                     """el => {
                         const link = (el.innerText || '').trim();
+                        // Preferred: text preceding this anchor within its
+                        // nearest block — field-specific, can't inherit a
+                        // sibling field's label that sits *after* it.
+                        const block = el.closest('p, li, td, dd, div');
+                        if (block) {
+                            try {
+                                const range = document.createRange();
+                                range.setStart(block, 0);
+                                range.setEndBefore(el);
+                                const pre = range.toString()
+                                    .replace(/\\s+/g, ' ').trim();
+                                if (pre.length > 0) return pre;
+                            } catch (e) { /* fall through */ }
+                        }
+                        // Fallback: walk ancestors, stripping the link's text.
                         let cur = el.parentElement;
                         for (let depth = 0; depth < 4 && cur; depth++) {
                             const own = (cur.innerText || '').replace(/\\s+/g, ' ').trim();
@@ -416,20 +482,39 @@ class CtbgComplaintFiller:
         await candidates.first.fill(value)
         await self._accept_modal()
 
-    async def _wicket_select(self, label_re: re.Pattern[str], option_text: str) -> None:
+    async def _wicket_select(
+        self,
+        label_re: re.Pattern[str],
+        option_text: Optional[str] = None,
+        option_value: Optional[str] = None,
+    ) -> None:
+        """Select an option in a Wicket inline `<select>`.
+
+        Match the option either by its visible text (`option_text`) or by its
+        `value` attribute (`option_value`). Prefer `option_value` for fields
+        whose values are a stable portal-defined enum (e.g. the autonómico/local
+        "Comunidad Autónoma" dropdown: `principado_asturias`, …), since the
+        visible labels are locale-sensitive; use `option_text` when the backend
+        already carries the literal label (e.g. RAZONES DE LA RECLAMACIÓN).
+        """
+        if (option_text is None) == (option_value is None):
+            raise CtbgFillerError(
+                "_wicket_select requiere exactamente uno de option_text/option_value"
+            )
         await self._open_wicket_field(label_re)
         sel = self.page.locator('select[name*=":select-field"]').first
         await sel.wait_for(state="attached", timeout=10_000)
-        # Wicket may hide the native <select>; set the value by matching option
-        # text via JS and dispatch change so the framework's listener fires.
+        # Wicket may hide the native <select>; set the value by matching the
+        # option via JS and dispatch change so the framework's listener fires.
         await sel.evaluate(
-            """(el, label) => {
-                const opt = Array.from(el.options).find(o => o.text.trim() === label);
-                if (!opt) throw new Error('option not found: ' + label);
+            """(el, {text, value}) => {
+                const opt = Array.from(el.options).find(o =>
+                    value != null ? o.value === value : o.text.trim() === text);
+                if (!opt) throw new Error('option not found: ' + (value ?? text));
                 el.value = opt.value;
                 el.dispatchEvent(new Event('change', { bubbles: true }));
             }""",
-            option_text,
+            {"text": option_text, "value": option_value},
         )
         await self._accept_modal()
 
@@ -475,7 +560,28 @@ class CtbgComplaintFiller:
 
         await self._upload_via_modal(file_path, validity)
 
-    async def _upload_via_modal(self, file_path: Path, validity: str) -> None:
+    async def _add_additional_doc(
+        self,
+        file_path: Path,
+        description: str = "",
+        validity: str = VALIDITY_ORIGINAL,
+    ) -> None:
+        """Click "Añadir documento adicional" and upload *file_path* via the modal.
+
+        El formulario autonómico/local usa esta vía para respuesta/notificación
+        (son opcionales — el CTBG los acepta como documentación adicional cuando
+        los tenemos pero no los requiere como cards obligatorias).
+
+        El modal de documentación adicional tiene el mismo flujo de dos pasos
+        que el modal de cards obligatorias (validez → fichero). Si el portal
+        regional omitiera el paso de validez, el localizador `button:has-text
+        ("Siguiente")` no encontraría el botón y lanzará CtbgFillerError con un
+        mensaje claro — en ese caso adaptar a un único paso.
+        """
+        await self.page.locator('button:has-text("Añadir documento adicional")').first.click()
+        await self._upload_via_modal(file_path, validity, description=description)
+
+    async def _upload_via_modal(self, file_path: Path, validity: str, description: str = "") -> None:
         """Drive the two-step "Cargar documento" iframe modal.
 
         Selectors are kept generic because Wicket assigns ids per render
