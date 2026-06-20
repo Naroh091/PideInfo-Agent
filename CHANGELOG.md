@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.0](https://github.com/Naroh091/PideInfo-Agent/compare/v0.9.0...v0.10.0) (2026-06-20)
+
+
+### Features
+
+* implement complaints for regional/local requests via CTBG, regional bodies via REG ([d89c211](https://github.com/Naroh091/PideInfo-Agent/commit/d89c211af94a04c5ae535583b20a3f7c269e4cca))
+
 ## [0.9.0](https://github.com/Naroh091/PideInfo-Agent/compare/v0.8.0...v0.9.0) (2026-06-09)
 
 
