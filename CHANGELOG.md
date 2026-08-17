@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.10.2](https://github.com/Naroh091/PideInfo-Agent/compare/v0.10.1...v0.10.2) (2026-08-17)
+
+
+### Bug Fixes
+
+* adjunta el PDF de la reclamación en la presentación CTBG y REG ([e2da52c](https://github.com/Naroh091/PideInfo-Agent/commit/e2da52cc0c41fa1000e78aa65846e1ebd6a0d7be))
+* adjunta el PDF de la reclamación en la presentación CTBG y REG ([c203f02](https://github.com/Naroh091/PideInfo-Agent/commit/c203f02f26b75e2bedd68c90550a13bb03136e88))
+
 ## [0.10.1](https://github.com/Naroh091/PideInfo-Agent/compare/v0.10.0...v0.10.1) (2026-08-17)
 
 
