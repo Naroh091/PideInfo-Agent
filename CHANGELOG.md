@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.1](https://github.com/Naroh091/PideInfo-Agent/compare/v0.10.0...v0.10.1) (2026-08-17)
+
+
+### Bug Fixes
+
+* robustify step-2 borrador submission against real-portal quirks ([097d332](https://github.com/Naroh091/PideInfo-Agent/commit/097d3329eafd96e7c1f86cdc46048c561a113f24))
+
 ## [0.10.0](https://github.com/Naroh091/PideInfo-Agent/compare/v0.9.0...v0.10.0) (2026-06-20)
 
 
