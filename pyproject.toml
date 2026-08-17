@@ -1,6 +1,6 @@
 [project]
 name = "pideinfo-agent"
-version = "0.10.0"
+version = "0.10.1"
 description = "PideInfo Agent — Syncs Portal de Transparencia with PideInfo"
 requires-python = ">=3.11"
 dependencies = [
