@@ -236,6 +236,7 @@ async def _download_pdfs(payload: dict, work_dir: Path, client: Any) -> dict:
     paths: dict[str, Optional[Path]] = {}
     urls = {
         "solicitud":    payload.get("solicitud_pdf_url"),
+        "reclamacion":  payload.get("pdf_download_url"),
         "respuesta":    payload.get("respuesta_pdf_url"),
         "notificacion": payload.get("notificacion_pdf_url"),
         "justificante": payload.get("justificante_pdf_url"),
@@ -317,20 +318,27 @@ async def _step3_documentos(page, pdf_paths: dict, console) -> None:
     ficheros de una sola llamada, así que subimos todos los PDFs a la
     vez vía Playwright's expect_file_chooser.
 
-    Orden de adjuntos (se omiten los None):
-      solicitud · respuesta · notificacion · justificante
-    Límites del portal: máx 5 ficheros, 10 MB cada uno, 15 MB total.
+    Orden de prioridad de adjuntos (se omiten los None):
+      solicitud · reclamacion · respuesta · notificacion · justificante · prorroga
+    Límites del portal: máx 5 ficheros, 10 MB cada uno, 15 MB total. Si con la
+    reclamación en PDF se superan los 5 disponibles, se recorta por la cola de
+    esa lista de prioridad — la prórroga es la primera en quedarse fuera, por
+    ser la menos relevante para el fondo del caso.
     """
-    paths_to_upload = [
-        p for p in [
-            pdf_paths.get("solicitud"),
-            pdf_paths.get("prorroga"),
-            pdf_paths.get("respuesta"),
-            pdf_paths.get("notificacion"),
-            pdf_paths.get("justificante"),
-        ]
-        if p is not None
+    candidates = [
+        pdf_paths.get("solicitud"),
+        pdf_paths.get("reclamacion"),
+        pdf_paths.get("respuesta"),
+        pdf_paths.get("notificacion"),
+        pdf_paths.get("justificante"),
+        pdf_paths.get("prorroga"),
     ]
+    paths_to_upload = [p for p in candidates if p is not None]
+
+    if len(paths_to_upload) > 5:
+        dropped = [p.name for p in paths_to_upload[5:]]
+        console.print(f"[yellow]REG paso 3: {len(paths_to_upload)} PDFs disponibles, el portal admite 5 — se omiten: {', '.join(dropped)}[/]")
+        paths_to_upload = paths_to_upload[:5]
 
     if not paths_to_upload:
         console.print("[dim]REG paso 3: sin adjuntos (ningún PDF disponible)[/]")
