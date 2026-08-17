@@ -248,8 +248,15 @@ class CtbgComplaintFiller:
                 # Single card: Solicitud de información
                 await self._attach_required_doc(0, self.files["solicitud"])
 
-        # No subimos el PDF de la reclamación como adicional: su texto ya va
-        # en el campo "Exponga brevemente los motivos" del paso 2.
+        # Adjuntamos también el PDF de la reclamación argumentada como
+        # documentación adicional. Su texto ya va en el campo "Exponga
+        # brevemente los motivos" del paso 2, pero el PDF conserva el
+        # formato (negritas, párrafos, citas) que ese textarea no admite.
+        if self.files.get("reclamacion"):
+            await self._add_additional_doc(
+                self.files["reclamacion"],
+                description="Reclamación argumentada",
+            )
 
         await self._click_save_continue()
 
