@@ -219,6 +219,8 @@ async def _drive(
                     await _capture_failure(page, work_dir, "wizard_did_not_render")
                     raise
 
+                await _dismiss_cookie_banner(page, console)
+
                 client.progress_task(task_id, status="in_progress", note="Paso 1: Datos del solicitante")
                 await _step1_advance(page, payload.get("solicitante") or {}, console)
 
@@ -367,6 +369,7 @@ async def _step1_advance(page, profile: dict | None, console) -> None:
         except RuntimeError:
             pass
 
+    await _dismiss_cookie_banner(page, console)
     await _click_dnt_button(page, "Siguiente")
     await asyncio.sleep(0.8)
 
@@ -398,23 +401,67 @@ async def _step2_submit_capture_id_borr(page, console) -> Optional[str]:
     up the portal is still working, so we keep waiting (up to a hard cap);
     only once the spinner clears WITHOUT reaching /firma do we treat it as a
     real failure and read the (visible) validation errors.
+
+    A third, distinct outcome is "we can't tell" — ``_portal_is_processing``
+    itself failed (its `page.evaluate` threw). That used to be treated the
+    same as "spinner is gone" and raised `step2_did_not_advance` after a
+    single 20s chunk (Sentry, 2026-08-17: a run failed in ~25s while its own
+    failure screenshot still showed the spinner up — the evaluate call, not
+    the portal, was what actually failed). Now we give that ambiguous state
+    its own budget before giving up.
+
+    A fourth, confirmed-live outcome (2026-08-17, manual headless/headed
+    Playwright runs against the real portal with a real FNMT session):
+    the spinner can clear a few seconds BEFORE the redirect to /firma
+    actually fires — observed gaps of 1-5s between `_portal_is_processing`
+    returning False and the URL flipping. Treating "spinner gone, not on
+    /firma yet" as an immediate, final failure was catching the portal
+    mid-transition. A short grace window right after the spinner clears
+    (below, `grace_ms`) resolved every reproduction of this failure without
+    needing the full next 20s chunk.
     """
     # Hard ceiling for the borrador mint. Overridable without a rebuild via
     # PT_STEP2_MINT_TIMEOUT_S — handy while we still don't know the portal's
     # real worst case.
     overall_cap_s = int(os.getenv("PT_STEP2_MINT_TIMEOUT_S", "360"))
+    # Ceiling for consecutive "couldn't tell" chunks (evaluate() itself
+    # errored) before we give up — separate from overall_cap_s, which only
+    # governs the confirmed-still-processing case.
+    uncertain_cap_s = int(os.getenv("PT_STEP2_UNCERTAIN_CAP_S", "300"))
+    # How long to keep polling for /firma right after the spinner clears,
+    # before treating it as a genuine failure. 30s gives generous (~6x)
+    # margin over the largest observed gap (5s) between spinner-gone and
+    # the actual redirect — cheap to wait out given a real failure still
+    # gets caught, just a bit later.
+    grace_ms = int(os.getenv("PT_STEP2_GRACE_MS", "30000"))
     chunk_ms = 20_000
 
+    await _dismiss_cookie_banner(page, console)
     await _click_dnt_button(page, "Siguiente")
 
     waited = 0
+    uncertain_waited = 0
     while True:
         try:
             await page.wait_for_url("**/procedimiento/firma?**", timeout=chunk_ms)
             return _extract_query_param(page.url, "idBorr")
         except Exception:
             waited += chunk_ms // 1000
-            if await _portal_is_processing(page):
+            processing = await _portal_is_processing(page)
+
+            if processing is None:
+                uncertain_waited += chunk_ms // 1000
+                if uncertain_waited >= uncertain_cap_s:
+                    raise RuntimeError(
+                        f"step2_uncertain_state: no se pudo comprobar el estado del "
+                        f"portal durante {uncertain_waited}s (fallos repetidos al "
+                        f"consultar el DOM); URL: {page.url}"
+                    )
+                console.print(f"[dim]Portal: estado incierto, reintentando… ({uncertain_waited}s)[/]")
+                continue
+            uncertain_waited = 0  # Got a definitive read — reset the ambiguous-state budget.
+
+            if processing:
                 if waited >= overall_cap_s:
                     raise RuntimeError(
                         f"step2_portal_timeout: el portal lleva {waited}s en "
@@ -422,7 +469,16 @@ async def _step2_submit_capture_id_borr(page, console) -> Optional[str]:
                     )
                 console.print(f"[dim]Portal procesando el envío… ({waited}s)[/]")
                 continue
-            # Spinner gone and still not on /firma → genuine step-2 failure.
+            # Spinner is gone but we're not on /firma yet — before calling this
+            # a real failure, give the portal a short grace window in case the
+            # redirect is just lagging the spinner clearing (see docstring).
+            try:
+                await page.wait_for_url("**/procedimiento/firma?**", timeout=grace_ms)
+                return _extract_query_param(page.url, "idBorr")
+            except Exception:
+                pass
+
+            # Still not on /firma after the grace window → genuine step-2 failure.
             errors = await _collect_validation_errors(page)
             if errors:
                 raise RuntimeError("step2_validation: " + "; ".join(errors[:6]))
@@ -432,10 +488,17 @@ async def _step2_submit_capture_id_borr(page, console) -> Optional[str]:
             )
 
 
-async def _portal_is_processing(page) -> bool:
+async def _portal_is_processing(page) -> Optional[bool]:
     """True while the portal shows its "Estamos procesando tu solicitud…"
     overlay — a visible `dnt-spinner` or that text both count. Used to tell a
-    slow-but-working mint apart from a stalled one."""
+    slow-but-working mint apart from a stalled one.
+
+    Returns None (not False) when the check itself fails — a transient
+    `page.evaluate` error (e.g. DOM churn from the cookie banner re-render)
+    is not evidence the portal stopped processing, and treating it as such
+    caused a premature `step2_did_not_advance` after a single 20s chunk even
+    while the spinner was still visibly up.
+    """
     try:
         return await page.evaluate(
             """() => {
@@ -452,8 +515,9 @@ async def _portal_is_processing(page) -> bool:
                 return /procesando tu solicitud/i.test(document.body.innerText || '');
             }"""
         )
-    except Exception:
-        return False
+    except Exception as e:
+        logger.warning("submit_request_transparencia: _portal_is_processing evaluate failed: %s", e)
+        return None
 
 
 async def _step3_sign(page, console, *, id_borr: Optional[str]) -> None:
@@ -475,6 +539,7 @@ async def _step3_sign(page, console, *, id_borr: Optional[str]) -> None:
     # Tick every checkbox on this step (we know there are exactly two:
     # privacy + veracidad). Idempotent if already checked.
     await _check_all_dnt_checkboxes(page)
+    await _dismiss_cookie_banner(page, console)
     await _click_dnt_button(page, "Siguiente")
 
     # ── PUNTO DE NO RETORNO ──────────────────────────────────────────────
@@ -801,6 +866,44 @@ async def _click_dnt_button(page, label: str) -> None:
             )
         except Exception:
             pass
+
+
+async def _dismiss_cookie_banner(page, console) -> None:
+    """Best-effort dismissal of the portal's cookie-consent banner
+    ("Gestión de Cookies" / "Aceptar todas las cookies").
+
+    Never handled before (Sentry, 2026-08-17): a run's failure screenshot
+    showed this banner still open, overlapping the step-2 "Siguiente"
+    button, at the exact moment ``step2_did_not_advance`` fired. No proof
+    it caused that failure, but it's a portal element we've never accounted
+    for and it costs nothing to clear defensively before every "Siguiente".
+
+    Verified live (headless Firefox against the real portal, 2026-08-17):
+    the banner is a `<dnt-cookies id="cookiesBanner">` custom element, NOT
+    a `<dnt-button>` — the `_click_dnt_button` shadow-DOM-pierce approach
+    used elsewhere in this file doesn't see it, because it only queries
+    top-level `dnt-button` elements and this one's button lives inside
+    `dnt-cookies`' own (closed) shadow root. What DOES reach it is
+    Playwright's role-based locator (`get_by_role`), which resolves
+    against the browser's accessibility tree rather than the DOM — that
+    crosses shadow boundaries regardless of open/closed. Confirmed the
+    click actually registers consent: after clicking, a page reload no
+    longer renders the button at all (not just hidden).
+
+    Short-circuits fast when the banner isn't there — it shows once per
+    profile, not on every navigation once consent is recorded, so the
+    common case (nothing to dismiss) must not cost a timeout wait. Verified
+    the same run: ``count()`` resolves instantly either way (0 vs 1),
+    unlike ``click(timeout=...)`` on a locator with 0 matches, which blocks
+    for the full timeout before giving up.
+    """
+    try:
+        btn = page.get_by_role("button", name="Aceptar todas las cookies")
+        if await btn.count() > 0:
+            await btn.click(timeout=2_000)
+            console.print("[dim]Banner de cookies: aceptado[/]")
+    except Exception:
+        pass  # No banner present (or dismiss failed) — nothing to do.
 
 
 async def _is_step_active(page, step_index: int) -> bool:
